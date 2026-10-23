@@ -1,72 +1,75 @@
 import './style.css';
 import * as Tone from 'tone';
-import { Engine, cutoffHz, renderWav } from './engine.js';
-import { SOUNDS, SOUND_IDS } from './sounds.js';
-import {
-  newSong, normalizeSong, resizeSong, remapMelodies, isEmpty, chordAtStep,
-  DRUM_LANES, TRACKS, CHORD_STYLES, STEP_OPTIONS,
-} from './song.js';
-import { MOODS, KEYS, chordPalette, voiceChord, melodicRows, pcName } from './theory.js';
-import { DRUM_PRESETS, applyDrumPreset, applyProgression, generateBass, generateLead, demoSong } from './patterns.js';
-import { el, knob, expMap, xyPad } from './ui.js';
+import { Engine, renderWav } from './engine.js';
+import { newSong, normalizeSong, apply, TRACKS, ROWS, SLOT, LOOP, isSlotTrack, BPM_RANGE } from './song.js';
+import { demoSong } from './demo.js';
+import { el, xyPad, knobPad } from './ui.js';
+import { strokeCanvas } from './stroke.js';
+import { Mic, addClip, clips, loadClips, newClipId, trimTake, outline } from './voice.js';
+import { Coach } from './tour.js';
 
-const STORAGE_KEY = 'mixpult.song.v1';
-// Home row first, then the top row (without R, which toggles recording) for longer scales.
-const PAD_KEYS = ['KeyA', 'KeyS', 'KeyD', 'KeyF', 'KeyG', 'KeyH', 'KeyJ', 'KeyK', 'KeyL', 'Semicolon', 'Quote',
-  'KeyQ', 'KeyW', 'KeyE', 'KeyT', 'KeyY', 'KeyU', 'KeyI', 'KeyO', 'KeyP'];
-const keyLabels = { Semicolon: ';', Quote: "'" };
-for (const code of PAD_KEYS) if (code.startsWith('Key')) keyLabels[code] = code.slice(3);
-const CHORD_COLORS = ['#ff7a6b', '#ffb454', '#f5dd5c', '#7fe09a', '#5cc4ff', '#b49bff'];
+const STORAGE_KEY = 'mixpult.song.v3';
+const PAD_KEYS = ['KeyA', 'KeyS', 'KeyD', 'KeyF'];
+const HOLD_KEY = 'KeyF';
+const keyLabels = Object.fromEntries(PAD_KEYS.map((c) => [c, c.slice(3)]));
+// Chords are never named: each one is just a colour (index-aligned with CHORDS).
+const CHORD_COLORS = ['#ff3ea5', '#ffb03a', '#9b6bff', '#36d6ff', '#ff6b4a', '#4dffb8'];
+const CHORD_ORDER = [4, 0, 5, 1, 2, 3]; // knob rows: darkest at the bottom, brightest at the top
+
+const ICONS = {
+  drums: '<circle cx="12" cy="13" r="7"/><path d="M5 13h14M9 4l2 4M15 4l-2 4"/>',
+  chords: '<path d="M4 7h16M4 12h16M4 17h16"/><circle cx="8" cy="7" r="1.6"/><circle cx="14" cy="12" r="1.6"/><circle cx="10" cy="17" r="1.6"/>',
+  bass: '<path d="M3 14c2.5 0 2.5-6 5-6s2.5 8 5 8 2.5-6 5-6 2 2 3 2"/>',
+  lead: '<path d="M9 18V5l11-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="17" cy="16" r="3"/>',
+  voice: '<rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/>',
+  fx: '<path d="M12 3v4M12 17v4M3 12h4M17 12h4M6 6l2.5 2.5M15.5 15.5 18 18M6 18l2.5-2.5M15.5 8.5 18 6"/>',
+};
 
 const TABS = [
-  {
-    id: 'drums', name: 'Bicí', color: 'var(--c-drums)',
-    hint: 'Pusť smyčku (mezerník) a ťukej do rytmu klávesami A, S, D… nebo klikej na tlačítka. Co ťukneš, uloží se do smyčky. Do mřížky můžeš i rovnou klikat. Nevíš, kde začít? Vyber hotový rytmus.',
-  },
-  {
-    id: 'chords', name: 'Akordy', color: 'var(--c-chords)',
-    hint: 'Všechny tyhle akordy k sobě ladí. Během přehrávání akord drž – hraje tak dlouho, jak dlouho držíš klávesu. Nebo vyber akord a maluj ho do řádku dole. Obvykle stačí 4 akordy.',
-  },
-  {
-    id: 'bass', name: 'Basa', color: 'var(--c-bass)',
-    hint: 'Každé tlačítko je ve stupnici, takže nic nezní falešně. „Kořen akordu“ hraje vždy základní tón právě znějícího akordu – nejjistější volba. Delší držení = delší tón.',
-  },
-  {
-    id: 'lead', name: 'Melodie', color: 'var(--c-lead)',
-    hint: 'Jako basa, jen výš. Svítící řádky jsou tóny právě hrajícího akordu – na nich melodie zní nejlíp, hlavně na začátku doby. Klikni a táhni v mřížce pro delší tón.',
-  },
-  {
-    id: 'fx', name: 'Šmrdlátka', color: 'var(--c-fx)',
-    hint: 'Teď jsi DJ. Táhni po ploše: doleva tlumíš výšky, doprava ubíráš basy, nahoru přidáváš ozvěnu. Drž tlačítka „zaseknout“ pro efekt opakování. Pusť a vše se vrátí.',
-  },
+  { id: 'drums', name: 'Drums', color: 'var(--c-drums)', labels: ['kick only', '', 'everything'] },
+  { id: 'chords', name: 'Mood', color: 'var(--c-chords)', labels: ['pad', 'stab', 'arpeggio'] },
+  { id: 'bass', name: 'Bass', color: 'var(--c-bass)', labels: ['deep', 'sharp', 'acid'] },
+  { id: 'lead', name: 'Melody', color: 'var(--c-lead)', labels: ['sklo', 'bleep', 'laser'] },
+  { id: 'voice', name: 'Voice', color: 'var(--c-voice)' },
+  { id: 'fx', name: 'FX', color: 'var(--c-fx)' },
 ];
-const TRACK_COLOR = Object.fromEntries(TABS.map((t) => [t.id, t.color]));
-const TRACK_NAME = Object.fromEntries(TABS.map((t) => [t.id, t.name]));
+const TAB = Object.fromEntries(TABS.map((t) => [t.id, t]));
 
 // ---------- state ----------
 
-let song = loadSong();
+// Every new song starts with two clips on the launchpad, so Voice works before you record.
+const PRESET_CLIPS = { workit: 'samples/voice/workit.wav', doit: 'samples/voice/doit.wav' };
+function freshSong() {
+  const s = newSong();
+  Object.keys(PRESET_CLIPS).forEach((clip, i) => apply(s, { k: 'pad', i, clip }));
+  return s;
+}
+
+const stored = readStored();
+let song = stored ?? freshSong();
 const engine = new Engine(song);
 let tab = 'drums';
-let rec = true;
-let pen = 0; // chord used when painting the chord lane, null = eraser
 let playStep = -1;
-let chordRec = null; // chord being recorded while its pad is held
-const perf = { dj: 0, echo: 0, master: 0.9, spring: true };
 const undoStack = [];
-let lastCheckpoint = { tag: null, t: 0 };
+// Started from the home screen: already full screen, no browser bars.
+const homeScreen = navigator.standalone === true
+  || matchMedia('(display-mode: fullscreen), (display-mode: standalone)').matches;
+let lastUndo = { tag: null, t: 0 };
 const padHandlers = new Map(); // key code -> { down(): release fn, el }
-const heldKeys = new Map(); // key code -> release fn
-let view = {}; // references into the current panel, for fast playhead updates
+const heldKeys = new Map();
+let view = {}; // hooks into the current panel: playhead, onStep, knob
 
-function loadSong() {
+// Knob positions [x, row] survive tab switches.
+const knobAt = { drums: [0.5, 2], chords: [0.5, CHORD_ORDER.indexOf(0)], bass: [0.5, 0], lead: [0.5, 3] };
+
+function readStored() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    if (raw) return normalizeSong(JSON.parse(raw), SOUND_IDS);
+    if (raw) return normalizeSong(JSON.parse(raw));
   } catch {
     /* broken or blocked storage: start fresh */
   }
-  return newSong();
+  return null;
 }
 
 let saveTimer = null;
@@ -78,105 +81,65 @@ function save() {
     } catch {
       /* storage full or blocked, the song still lives in memory */
     }
-  }, 300);
+  }, 400);
 }
 
-// Undo snapshot. Same tag within 2 s is merged, so one recording pass is one undo step.
-function checkpoint(tag = null) {
+// Every edit goes through here. `tag` merges a burst of edits (one recording pass) into one undo step.
+function dispatch(op, { tag = null } = {}) {
   const now = performance.now();
-  if (tag && tag === lastCheckpoint.tag && now - lastCheckpoint.t < 2000) {
-    lastCheckpoint.t = now;
-    return;
+  const newStep = !(tag && tag === lastUndo.tag && now - lastUndo.t < 2000);
+  const before = newStep ? JSON.stringify(song) : null;
+  if (!apply(song, op)) return false;
+  if (newStep) {
+    undoStack.push(before);
+    if (undoStack.length > 100) undoStack.shift();
   }
-  undoStack.push(JSON.stringify(song));
-  if (undoStack.length > 120) undoStack.shift();
-  lastCheckpoint = { tag, t: now };
-  document.getElementById('undo').disabled = false;
+  lastUndo = { tag, t: now };
+  engine.sync(op);
+  save();
+  if (op.k === 'slot' && op.t === 'chords') renderSong();
+  if (op.k === 'note' || op.k === 'clear') renderTabs();
+  if (op.k === 'mute') renderPanel();
+  return true;
 }
 
 function undo() {
   const snap = undoStack.pop();
-  document.getElementById('undo').disabled = !undoStack.length;
   if (!snap) return;
-  replaceSong(normalizeSong(JSON.parse(snap), SOUND_IDS));
-  toast('Vráceno zpět');
+  setSong(normalizeSong(JSON.parse(snap)));
+  toast('Undone');
 }
 
-function replaceSong(s) {
+function setSong(s) {
   song = s;
-  chordRec = null;
   engine.setSong(song);
+  save();
   renderAll();
-  save();
 }
 
-// Something in the song changed: persist and refresh what shows it.
-function changed({ panel = false } = {}) {
-  save();
-  renderOverview();
-  renderTabs();
-  if (panel) renderPanel();
-  else view.refresh?.();
-}
-
+const $ = (id) => document.getElementById(id);
 const mod = (a, n) => ((a % n) + n) % n;
-const recording = () => rec && engine.playing;
-const palette = () => chordPalette(song.mood, song.key);
 
 let toastTimer = null;
-function toast(msg) {
-  const t = document.getElementById('toast');
+function toast(msg, ms = 1800) {
+  const t = $('toast');
   t.textContent = msg;
   t.classList.add('show');
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => t.classList.remove('show'), 1800);
+  toastTimer = setTimeout(() => t.classList.remove('show'), ms);
 }
 
 // ---------- header ----------
 
-const $ = (id) => document.getElementById(id);
-
 function initHeader() {
   $('play').addEventListener('click', togglePlay);
-  $('rec').addEventListener('click', toggleRec);
-  $('metro').addEventListener('click', toggleMetro);
-  $('undo').addEventListener('click', undo);
-  $('undo').disabled = true;
-
-  $('bpm').addEventListener('input', (e) => {
-    checkpoint('bpm');
-    song.bpm = Number(e.target.value);
-    engine.transport.bpm.rampTo(song.bpm, 0.1);
-    $('bpm-out').textContent = song.bpm;
-    save();
+  $('menu').addEventListener('toggle', () => {
+    $('menu-undo').disabled = !undoStack.length;
+    // ponytail: screen numbers for sorting out iPhone layout gaps from a screenshot; drop once settled.
+    const safe = getComputedStyle($('tabs')).paddingBottom;
+    $('screen-info').textContent = `view ${Math.round(window.innerHeight)} · app ${Math.round(document.body.getBoundingClientRect().height)} · screen ${screen.height} · pad ${safe}${homeScreen ? ' · home' : ''}`;
   });
-  $('swing').addEventListener('input', (e) => {
-    checkpoint('swing');
-    song.swing = Number(e.target.value);
-    engine.setSwing(song.swing);
-    $('swing-out').textContent = `${Math.round(song.swing * 100)} %`;
-    save();
-  });
-
-  for (const [id, mood] of Object.entries(MOODS)) $('mood').append(el('option', { value: id }, mood.name));
-  for (const k of KEYS) $('key').append(el('option', { value: k.pc }, k.name));
-  $('mood').addEventListener('change', (e) => setHarmony(e.target.value, song.key));
-  $('key').addEventListener('change', (e) => setHarmony(song.mood, Number(e.target.value)));
-
-  const lengthNames = { 16: '1 takt', 32: '2 takty', 64: '4 takty' };
-  for (const n of STEP_OPTIONS) {
-    $('length').append(el('button', {
-      dataset: { steps: n },
-      title: `${n} kroků`,
-      onclick: () => {
-        if (n === song.steps) return;
-        checkpoint();
-        resizeSong(song, n);
-        changed({ panel: true });
-        updateHeader();
-      },
-    }, lengthNames[n]));
-  }
+  initFullscreen();
 
   $('latency').addEventListener('input', (e) => {
     engine.latency = Number(e.target.value) / 1000;
@@ -196,7 +159,7 @@ function initHeader() {
     $('menu').open = false;
     menuAction(act);
   });
-  document.addEventListener('click', (e) => {
+  document.addEventListener('pointerdown', (e) => {
     if (!e.target.closest('#menu')) $('menu').open = false;
   });
   $('file').addEventListener('change', async (e) => {
@@ -205,67 +168,65 @@ function initHeader() {
     if (!f) return;
     try {
       const data = JSON.parse(await f.text());
-      checkpoint();
-      replaceSong(normalizeSong(data, SOUND_IDS));
-      toast('Písnička načtena');
+      if (data?.v !== 3) throw new Error('not a v3 song');
+      undoStack.push(JSON.stringify(song));
+      setSong(normalizeSong(data));
+      toast('Song loaded');
     } catch {
-      toast('Tohle není písnička z Mixpultu');
+      toast('That is not a Mixpult song');
     }
   });
 }
 
-function updateHeader() {
-  $('bpm').value = song.bpm;
-  $('bpm-out').textContent = song.bpm;
-  $('swing').value = song.swing;
-  $('swing-out').textContent = `${Math.round(song.swing * 100)} %`;
-  $('mood').value = song.mood;
-  $('key').value = song.key;
-  for (const b of $('length').children) b.classList.toggle('on', Number(b.dataset.steps) === song.steps);
-  $('play').classList.toggle('playing', engine.playing);
-  $('play').setAttribute('aria-label', engine.playing ? 'Zastavit' : 'Přehrát');
-  $('rec').classList.toggle('on', rec);
-  $('metro').classList.toggle('on', engine.metronome);
-  document.body.classList.toggle('is-recording', recording());
-}
-
-function setHarmony(mood, key) {
-  checkpoint();
-  const prev = { mood: song.mood, key: song.key, safe: song.safe };
-  song.mood = mood;
-  song.key = key;
-  remapMelodies(song, prev);
-  changed({ panel: true });
-  updateHeader();
+// Android and desktop get the real Fullscreen API. iPhone Safari has none for pages, only
+// "Add to Home Screen", which opens the app without browser bars (see the apple-* metas).
+function initFullscreen() {
+  const btn = $('fullscreen');
+  if (homeScreen) {
+    btn.hidden = true;
+    return;
+  }
+  const root = document.documentElement;
+  const request = root.requestFullscreen ?? root.webkitRequestFullscreen;
+  // In full screen the button has nothing left to do (the system gesture or Esc leaves it).
+  const sync = () => { btn.hidden = !!(document.fullscreenElement ?? document.webkitFullscreenElement); };
+  document.addEventListener('fullscreenchange', sync);
+  document.addEventListener('webkitfullscreenchange', sync);
+  btn.addEventListener('click', async () => {
+    if (!request) {
+      toast('On iPhone: Share → Add to Home Screen, then it runs full screen', 5000);
+      return;
+    }
+    try {
+      await request.call(root, { navigationUI: 'hide' });
+      await screen.orientation?.lock?.('portrait').catch(() => {});
+    } catch {
+      toast('Full screen is not available here');
+    }
+  });
 }
 
 async function menuAction(act) {
-  if (act === 'demo') {
-    checkpoint();
-    replaceSong(demoSong());
-    toast('Ukázka načtena – zmáčkni mezerník');
-  } else if (act === 'new') {
-    checkpoint();
-    stop();
-    replaceSong(newSong());
-    engine.metronome = true;
-    updateHeader();
-    setTab('drums');
-    toast('Čistý list. Začni bicími.');
+  if (act === 'new') {
+    undoStack.push(JSON.stringify(song));
+    setSong(freshSong());
+    await loadPresetClips();
+    toast('Blank slate');
+  } else if (act === 'tour') {
+    startTour();
+  } else if (act === 'undo') {
+    undo();
+  } else if (act === 'clear') {
+    dispatch({ k: 'clear', t: tab });
   } else if (act === 'save') {
-    const blob = new Blob([JSON.stringify(song, null, 1)], { type: 'application/json' });
-    download(blob, 'mixpult-pisnicka.json');
+    download(new Blob([JSON.stringify(song)], { type: 'application/json' }), 'mixpult-song.json');
   } else if (act === 'open') {
     $('file').click();
-  } else if (act === 'record') {
-    if (isEmpty(song)) {
-      toast('Nejdřív něco nahraj :)');
-      return;
-    }
-    toast('Vyrábím WAV…');
+  } else if (act === 'wav') {
+    toast('Rendering WAV…');
     const blob = await renderWav(song, 2);
     download(blob, `mixpult-${new Date().toISOString().slice(0, 10)}.wav`);
-    toast('Hotovo, nahrávka se stahuje');
+    toast('Done, downloading');
   }
 }
 
@@ -279,830 +240,522 @@ function download(blob, name) {
 
 // ---------- transport ----------
 
+function showPlaying() {
+  $('play').classList.toggle('playing', engine.playing);
+  $('play').setAttribute('aria-label', engine.playing ? 'Stop' : 'Play');
+  document.body.classList.toggle('is-playing', engine.playing);
+  if (tour && !tour.started && engine.playing) tourUpdate();
+}
+
 async function togglePlay() {
-  if (engine.playing) stop();
-  else {
-    await engine.ready;
-    await engine.start();
-    updateHeader();
-  }
+  if (engine.playing) engine.stop();
+  else await startLoop();
+  showPlaying();
 }
 
-function stop() {
-  engine.stop();
-  chordRec = null;
-  updateHeader();
+// Touching a knob or the record button starts the loop: everything happens over the running loop.
+async function startLoop() {
+  if (engine.playing) return;
+  await unlockAudio();
+  await engine.ready;
+  await engine.start();
+  showPlaying();
 }
 
-function toggleRec() {
-  rec = !rec;
-  updateHeader();
-  toast(rec ? 'Nahrávání zapnuto – ťukání se uloží' : 'Nahrávání vypnuto – můžeš si jen tak hrát');
-}
-
-function toggleMetro() {
-  engine.metronome = !engine.metronome;
-  updateHeader();
+// iPhone: play through the silent switch, and start audio on the first touch.
+async function unlockAudio() {
+  try {
+    if (navigator.audioSession) navigator.audioSession.type = 'playback';
+  } catch { /* not supported */ }
+  await Tone.start();
 }
 
 engine.onStep = (step) => {
   playStep = step;
-  if (step >= 0 && step % 4 === 0 && chordRec) continueChordRec(step / 4);
-  view.playhead?.(step);
-  overviewPlayhead(step);
+  songPlayhead(step);
+  view.onStep?.(step);
 };
 
-// ---------- overview ----------
+// ---------- the loop at a glance: the mood colours, half a bar each ----------
 
-function renderOverview() {
-  const ov = $('overview');
-  const steps = song.steps;
-  const pal = palette();
-  ov.replaceChildren();
-  view.ovHeads = [];
-  for (const t of TRACKS) {
-    const lane = el('div', { class: 'ov-lane', style: { gridTemplateColumns: `repeat(${steps}, 1fr)` } });
-    for (let s = 0; s < steps; s++) {
-      const cell = el('div', { class: `ov-cell${s % 16 === 0 ? ' bar' : s % 4 === 0 ? ' beat' : ''}` });
-      if (t === 'drums') {
-        const hits = DRUM_LANES.filter((l) => song.drums.pattern[l.id][s]).length;
-        if (hits) cell.style.setProperty('--fill', String(0.35 + hits * 0.2));
-      } else if (t === 'chords') {
-        const c = song.chords.beats[Math.floor(s / 4)];
-        if (c !== null) {
-          cell.style.background = CHORD_COLORS[c];
-          cell.classList.add('chord');
-          if (s % 4 === 0 && (s === 0 || song.chords.beats[s / 4 - 1] !== c)) {
-            cell.append(el('span', { class: 'ov-chord-name' }, pal[c].name));
-          }
-        }
-      }
-      lane.append(cell);
-    }
-    if (t === 'bass' || t === 'lead') {
-      const rows = melodicRows(t, song.mood, song.key, song.safe).length;
-      song[t].notes.forEach((n, s) => {
-        if (!n) return;
-        lane.append(el('div', {
-          class: 'ov-note',
-          style: { gridColumn: `${s + 1} / span ${Math.min(n.len, steps - s)}`, '--y': String(1 - n.row / (rows - 1)) },
-        }));
-      });
-    }
-    const head = el('div', { class: 'ov-head' });
-    lane.append(head);
-    view.ovHeads.push(head);
-    const audible = engine.audible(t);
-    ov.append(el('div', { class: `ov-row${tab === t ? ' sel' : ''}${audible ? '' : ' muted'}`, style: { '--c': TRACK_COLOR[t] } },
-      el('button', { class: 'ov-name', onclick: () => setTab(t) }, TRACK_NAME[t]),
-      el('button', { class: `ov-btn${song.mute[t] ? ' on' : ''}`, title: 'Ztlumit', onclick: () => toggleMute(t) }, 'M'),
-      el('button', { class: `ov-btn solo${song.solo[t] ? ' on' : ''}`, title: 'Jen tahle stopa', onclick: () => toggleSolo(t) }, 'S'),
-      lane));
-  }
-  overviewPlayhead(playStep);
+function renderSong() {
+  $('song').replaceChildren(el('button', { class: 'timeline', 'aria-label': 'Mood across the loop', onclick: () => setTab('chords') },
+    ...song.chords.slots.map((c, i) => el('i', { class: i % 2 ? '' : 'bar', style: { '--chord': CHORD_COLORS[c] } })),
+    el('span', { class: 'timeline-head' })));
+  songPlayhead(playStep);
 }
 
-function overviewPlayhead(step) {
-  for (const h of view.ovHeads || []) {
-    h.style.display = step < 0 ? 'none' : 'block';
-    h.style.gridColumn = String(step + 1);
-  }
-}
-
-function toggleMute(t) {
-  song.mute[t] = !song.mute[t];
-  engine.applyMutes();
-  changed({ panel: tab === 'fx' });
-}
-
-function toggleSolo(t) {
-  song.solo[t] = !song.solo[t];
-  engine.applyMutes();
-  changed({ panel: tab === 'fx' });
+function songPlayhead(step) {
+  const head = $('song').querySelector('.timeline-head');
+  if (!head) return;
+  head.style.display = step < 0 ? 'none' : 'block';
+  head.style.left = `${((step + 0.5) / LOOP) * 100}%`;
 }
 
 // ---------- tabs ----------
 
 function hasContent(t) {
-  if (t === 'drums') return DRUM_LANES.some((l) => song.drums.pattern[l.id].some(Boolean));
-  if (t === 'chords') return song.chords.beats.some((c) => c !== null);
-  if (t === 'bass' || t === 'lead') return song[t].notes.some(Boolean);
-  return false;
+  if (!isSlotTrack(t) && t !== 'fx') return song[t].notes.some(Boolean);
+  return t !== 'fx';
 }
 
 function renderTabs() {
-  $('tabs').replaceChildren(...TABS.map((t, i) => el('button', {
+  $('tabs').replaceChildren(...TABS.map((t) => el('button', {
     class: `tab${tab === t.id ? ' sel' : ''}${hasContent(t.id) ? ' done' : ''}`,
     style: { '--c': t.color },
     onclick: () => setTab(t.id),
-  }, el('span', { class: 'tab-num' }, hasContent(t.id) ? '✓' : String(i + 1)), el('span', { class: 'tab-name' }, t.name))));
+  }, svgIcon(ICONS[t.id]), el('span', {}, t.name))));
+}
+
+function svgIcon(paths) {
+  const span = el('span', { class: 'tab-icon' });
+  span.innerHTML = `<svg viewBox="0 0 24 24">${paths}</svg>`;
+  return span;
 }
 
 function setTab(id) {
-  if (tab === id) return;
   tab = id;
   renderTabs();
-  renderOverview();
   renderPanel();
 }
 
-// ---------- shared panel pieces ----------
+// ---------- shared pieces ----------
 
-function keyLabel(code) {
-  return keyLabels[code] || code;
+// The tab name lives in the header.
+function renderHeader() {
+  const title = $('tab-title');
+  title.textContent = TAB[tab].name;
+  title.style.setProperty('--c', TAB[tab].color);
+  const clear = $('menu-clear');
+  clear.hidden = isSlotTrack(tab) || tab === 'fx';
+  clear.textContent = `Clear ${TAB[tab].name.toLowerCase()}`;
 }
 
-// Pad button that works with mouse, touch and keyboard. down() returns the release function.
-function pad({ code, label, sub, color, cls = '', down }) {
-  const b = el('button', { class: `pad ${cls}`, style: color ? { '--pad': color } : undefined },
+// Pad that works with touch, mouse and keyboard. down(event) returns the release function.
+function pad({ code, label, sub, cls = '', down }) {
+  const b = el('button', { class: `pad ${cls}` },
     el('span', { class: 'pad-label' }, label),
-    sub ? el('span', { class: 'pad-sub' }, sub) : null,
-    code ? el('kbd', {}, keyLabel(code)) : null);
+    sub !== undefined ? el('span', { class: 'pad-sub' }, sub) : null,
+    code ? el('kbd', {}, keyLabels[code] ?? code.slice(3)) : null);
   let release = null;
-  b.addEventListener('pointerdown', (e) => {
+  let held = false;
+  b.addEventListener('pointerdown', async (e) => {
     e.preventDefault();
-    b.setPointerCapture(e.pointerId);
+    held = true;
+    try { b.setPointerCapture(e.pointerId); } catch { /* synthetic pointer */ }
     b.classList.add('pressed');
-    release = down();
+    if (Tone.getContext().state !== 'running') await unlockAudio();
+    release = down(e);
+    // Let go while the audio was still waking up (iPhone): still a tap, never a stuck press.
+    if (!held) up();
   });
   const up = () => {
+    held = false;
     b.classList.remove('pressed');
     release?.();
     release = null;
   };
   b.addEventListener('pointerup', up);
   b.addEventListener('pointercancel', up);
+  b.addEventListener('contextmenu', (e) => e.preventDefault());
   if (code) padHandlers.set(code, { down, el: b });
   return b;
 }
 
-function flash(node) {
-  if (!node) return;
-  node.classList.remove('hit');
-  void node.offsetWidth;
-  node.classList.add('hit');
+// ---------- a track: knob + record button + the loop as a line ----------
+
+const trackHex = (t) => getComputedStyle(document.documentElement).getPropertyValue(`--c-${t}`).trim();
+const loopPos = () => (engine.playing ? engine.heardStepFloat() % LOOP : null);
+
+// Writes a held note [a, b) (loop steps counting up from the start) into the loop, split at its end.
+function commitNote(t, row, a, b) {
+  const s = Math.round(a);
+  const len = Math.min(LOOP, Math.max(1, Math.round(b) - s));
+  const start = mod(s, LOOP);
+  const first = Math.min(len, LOOP - start);
+  dispatch({ k: 'note', t, s: start, note: { row, len: first } }, { tag: `rec-${t}` });
+  if (len > first) dispatch({ k: 'note', t, s: 0, note: { row, len: len - first } }, { tag: `rec-${t}` });
 }
 
-function chips(items, selected, onPick, cls = '') {
-  return el('div', { class: `chips ${cls}` }, ...items.map((it) => el('button', {
-    class: `chip${it.id === selected ? ' on' : ''}`,
-    title: it.hint || '',
-    onclick: () => onPick(it.id),
-  }, it.name, it.hint ? el('small', {}, it.hint) : null)));
+// What the line shows: runs of equal slots (drums, chords) or notes as they are played (bass, lead),
+// each with its average energy.
+function segments(t, toRow = (v) => v) {
+  const xs = song[t].x;
+  const avg = (s, len) => xs.slice(s, s + len).reduce((a, b) => a + b, 0) / len;
+  const out = [];
+  if (isSlotTrack(t)) {
+    const size = SLOT[t];
+    song[t].slots.forEach((v, i) => {
+      const last = out.at(-1);
+      if (last && last.v === v) last.len += size;
+      else out.push({ s: i * size, len: size, v });
+    });
+    for (const seg of out) Object.assign(seg, { row: toRow(seg.v), w: avg(seg.s, seg.len) });
+    return out;
+  }
+  song[t].notes.forEach((n, s) => n && out.push({ s, len: n.len, row: n.row, w: xs[s] }));
+  out.forEach((n, i) => {
+    if (out[i + 1]) n.len = Math.min(n.len, out[i + 1].s - n.s);
+  });
+  return out;
 }
 
-function section(title, ...children) {
-  return el('section', { class: 'block' }, title ? el('h3', {}, title) : null, ...children);
-}
+function trackPanel(t) {
+  const slotTrack = isSlotTrack(t);
+  const toValue = (row) => (t === 'chords' ? CHORD_ORDER[row] : row);
+  const toRow = (v) => (t === 'chords' ? CHORD_ORDER.indexOf(v) : v);
+  const colorOf = t === 'chords' ? (row) => CHORD_COLORS[CHORD_ORDER[row]] : () => trackHex(t);
+  const live = () => ({ row: toValue(knobAt[t][1]), x: knobAt[t][0] });
+  let touching = false;
+  // { from, row, gated } while recording; from = null while no note is being written.
+  // gated: the knob was touched during this hold, so from then on notes sound and record only
+  // while the knob is touched, exactly like playing it without recording (sharp, chopped notes).
+  let rec = null;
 
-const fmtHz = (v) => {
-  const hz = cutoffHz(v);
-  return v > 0.995 ? 'otevřený' : hz >= 1000 ? `${(hz / 1000).toFixed(1)} kHz` : `${Math.round(hz)} Hz`;
-};
-const fmtSec = (s) => (s < 1 ? `${Math.round(s * 1000)} ms` : `${s.toFixed(1)} s`);
-const fmtPct = (v) => `${Math.round(v * 100)}`;
+  const writeSlot = (pos) => {
+    const i = Math.floor((pos % LOOP) / SLOT[t]);
+    const v = toValue(knobAt[t][1]);
+    if (song[t].slots[i] !== v) dispatch({ k: 'slot', t, i, v }, { tag: `rec-${t}` });
+  };
 
-function trackKnobs(t) {
-  const mix = song.mix[t];
-  const k = (key, label, opts = {}) => knob({
-    label, value: mix[key], color: TRACK_COLOR[t], format: fmtPct, ...opts,
-    onInput: (v) => {
-      checkpoint(`knob-${t}-${key}`);
-      engine.setMix(t, key, v);
-      save();
+  const knob = knobPad({
+    rows: ROWS[t],
+    value: knobAt[t],
+    rowColor: colorOf,
+    labels: TAB[t].labels,
+    label: TAB[t].name,
+    onChange: (x, row) => {
+      const moved = row !== knobAt[t][1];
+      knobAt[t] = [x, row];
+      if (!touching && !rec) return;
+      engine.setLive(t, live());
+      if (!moved || rec?.from == null || !engine.playing) return;
+      // Recording and the row changed: the line steps to the new height.
+      const now = engine.heardStepFloat();
+      if (slotTrack) writeSlot(now);
+      else commitNote(t, rec.row, rec.from, now);
+      rec = { ...rec, from: now, row };
+    },
+    onTouch: async (on) => {
+      touching = on;
+      const gate = rec && !slotTrack;
+      if (on) {
+        if (gate) {
+          rec.gated = true;
+          rec.row = knobAt[t][1];
+          engine.clearLive(t); // a fresh attack, as without recording
+          rec.from = engine.playing ? engine.heardStepFloat() : null;
+          if (rec.from != null) rec.wrote = true;
+        }
+        engine.setLive(t, live());
+        await startLoop();
+      } else if (gate && rec.gated) {
+        if (rec.from != null && engine.playing) commitNote(t, rec.row, rec.from, engine.heardStepFloat());
+        rec.from = null;
+        engine.clearLive(t);
+      } else if (!rec) engine.clearLive(t);
     },
   });
-  const list = [
-    k('vol', 'Hlasitost', { dflt: 0.75 }),
-    k('cutoff', 'Jas', { dflt: 1, format: fmtHz }),
-    k('reso', 'Rezonance', { dflt: 0 }),
-  ];
-  if (t === 'drums') {
-    list.push(k('tune', 'Ladění', { min: -12, max: 12, dflt: 0, bipolar: true, format: (v) => `${v > 0 ? '+' : ''}${v.toFixed(1)}` }));
-  } else {
-    list.push(k('attack', 'Náběh', { map: expMap(0.001, 2), format: fmtSec, dflt: engine.tracks[t].inst.defaults.attack }));
-    list.push(k('release', 'Doznění', { map: expMap(0.02, 5), format: fmtSec, dflt: engine.tracks[t].inst.defaults.release }));
-  }
-  if (t === 'bass' || t === 'lead') list.push(k('glide', 'Klouzání', { max: 0.3, dflt: 0, format: fmtSec }));
-  list.push(k('reverb', 'Hall', { dflt: 0.2 }), k('delay', 'Ozvěna', { dflt: 0 }));
-  return section('Zvuk', el('div', { class: 'knobs' }, ...list));
-}
 
-function soundPicker(t) {
-  if (t === 'drums') {
-    return chips(SOUNDS.drums, song.drums.kit, async (id) => {
-      checkpoint();
-      song.drums.kit = id;
-      changed({ panel: true });
-      await engine.setKit(id);
-      if (!engine.playing) engine.drums.play('kick', Tone.immediate());
-    }, 'sound-chips');
-  }
-  return chips(SOUNDS[t], song[t].sound, async (id) => {
-    checkpoint();
-    song[t].sound = id;
-    const ready = engine.setSound(t, id);
-    changed({ panel: true });
-    await ready;
-    if (!engine.playing) previewTrack(t);
-  }, 'sound-chips');
-}
-
-function previewTrack(t) {
-  const now = Tone.immediate();
-  const inst = engine.tracks[t].inst;
-  if (t === 'chords') inst.play(voiceChord(palette()[pen ?? 0]), now, 0.8, 0.75);
-  else inst.play(melodicRows(t, song.mood, song.key, song.safe).find((r) => r.kind === 'note').midi + (t === 'bass' ? 12 : 0), now, 0.3, 0.85);
-}
-
-function panelHead(t) {
-  const meta = TABS.find((x) => x.id === t);
-  return el('div', { class: 'panel-head', style: { '--c': meta.color } },
-    el('h2', {}, el('span', { class: 'step-badge' }, String(TABS.indexOf(meta) + 1)), meta.name),
-    el('p', { class: 'hint' }, meta.hint));
-}
-
-// Grid with columns per step, plus ruler and a playhead overlay. Returns { wrap, grid, cells, head }.
-function stepGrid({ rows, cols, stepPerCol = 1, rowLabels, cls }) {
-  const colTpl = `repeat(${cols}, minmax(var(--cell-min), 1fr))`;
-  const ruler = el('div', { class: 'ruler', style: { gridTemplateColumns: colTpl } });
-  const colsPerBeat = 4 / stepPerCol;
-  for (let c = 0; c < cols; c += colsPerBeat) {
-    const step = c * stepPerCol;
-    const bar = Math.floor(step / 16) + 1;
-    const beat = Math.floor((step % 16) / 4) + 1;
-    ruler.append(el('span', { class: beat === 1 ? 'bar' : '', style: { gridColumn: `${c + 1} / span ${colsPerBeat}` } }, beat === 1 ? `takt ${bar}` : String(beat)));
-  }
-  const grid = el('div', { class: `grid ${cls}`, style: { gridTemplateColumns: colTpl, gridTemplateRows: `repeat(${rows}, var(--row-h))` } });
-  const cells = [];
-  for (let r = 0; r < rows; r++) {
-    cells.push([]);
-    for (let c = 0; c < cols; c++) {
-      const step = c * stepPerCol;
-      const cell = el('div', {
-        class: `cell${Math.floor(step / 4) % 2 ? ' odd' : ''}${step % 16 === 0 ? ' bar' : step % 4 === 0 ? ' beat' : ''}`,
-        dataset: { r, c },
-        style: { gridRow: String(r + 1), gridColumn: String(c + 1) },
-      });
-      cells[r].push(cell);
-      grid.append(cell);
-    }
-  }
-  const head = el('div', { class: 'playhead', style: { gridRow: '1 / -1', display: 'none' } });
-  grid.append(head);
-  const labels = el('div', { class: 'row-labels', style: { gridTemplateRows: `repeat(${rows}, var(--row-h))` } }, ...rowLabels);
-  const wrap = el('div', { class: `editor editor-${cls.split(' ')[0]}` }, el('div', { class: 'row-labels-col' }, el('div', { class: 'ruler-spacer' }), labels),
-    el('div', { class: 'grid-scroll' }, ruler, grid));
-  const setHead = (step) => {
-    head.style.display = step < 0 ? 'none' : 'block';
-    if (step >= 0) head.style.gridColumn = String(Math.floor(step / stepPerCol) + 1);
-  };
-  return { wrap, grid, cells, setHead };
-}
-
-// Pointer painting over grid cells (mouse drag and touch).
-function paintable(grid, { start, move, end }) {
-  let active = false;
-  let last = null;
-  const cellAt = (e) => document.elementsFromPoint(e.clientX, e.clientY).find((n) => n.classList?.contains('cell') && grid.contains(n));
-  grid.addEventListener('contextmenu', (e) => e.preventDefault());
-  grid.addEventListener('pointerdown', (e) => {
-    const cell = e.target.closest?.('.cell') || cellAt(e);
-    if (!cell && !e.target.closest('.note')) return;
-    e.preventDefault();
-    grid.setPointerCapture(e.pointerId);
-    active = start(e, cell) !== false;
-    last = cell;
-  });
-  grid.addEventListener('pointermove', (e) => {
-    if (!active) return;
-    const cell = cellAt(e);
-    if (cell && cell !== last) {
-      last = cell;
-      move(e, cell);
-    }
-  });
-  const stop = () => {
-    if (!active) return;
-    active = false;
-    end?.();
-  };
-  grid.addEventListener('pointerup', stop);
-  grid.addEventListener('pointercancel', stop);
-}
-
-// ---------- drums ----------
-
-function drumDown(lane) {
-  engine.hitDrum(lane);
-  if (recording()) {
-    const step = mod(Math.round(engine.heardStepFloat()), song.steps);
-    if (!song.drums.pattern[lane][step]) {
-      checkpoint('rec-drums');
-      song.drums.pattern[lane][step] = 1;
-      changed();
-    }
-  }
-  return null;
-}
-
-function drumsPanel() {
-  const pads = DRUM_LANES.map((lane, i) => pad({ code: PAD_KEYS[i], label: lane.name, color: 'var(--c-drums)', down: () => drumDown(lane.id) }));
-
-  const labels = DRUM_LANES.map((lane) => {
-    const vol = el('input', {
-      type: 'range', min: 0, max: 1, step: 0.01, value: song.drums.laneVol[lane.id], class: 'lane-vol', title: 'Hlasitost',
-      oninput: (e) => {
-        checkpoint(`lanevol-${lane.id}`);
-        song.drums.laneVol[lane.id] = Number(e.target.value);
-        engine.drums.setLaneVol(lane.id, song.drums.laneVol[lane.id]);
-        save();
-      },
-    });
-    return el('div', { class: 'row-label' },
-      el('button', { class: 'lane-name', onclick: () => engine.drums.play(lane.id, Tone.immediate()) }, lane.name), vol);
-  });
-  const g = stepGrid({ rows: DRUM_LANES.length, cols: song.steps, rowLabels: labels, cls: 'drum-grid' });
-
-  const refresh = () => {
-    DRUM_LANES.forEach((lane, r) => {
-      song.drums.pattern[lane.id].forEach((v, s) => g.cells[r][s].classList.toggle('on', !!v));
-    });
-  };
-  let paintVal = 1;
-  let touched = false;
-  const paint = (cell) => {
-    const lane = DRUM_LANES[Number(cell.dataset.r)].id;
-    const s = Number(cell.dataset.c);
-    if (song.drums.pattern[lane][s] === paintVal) return;
-    if (!touched) checkpoint();
-    touched = true;
-    song.drums.pattern[lane][s] = paintVal;
-    cell.classList.toggle('on', !!paintVal);
-    if (paintVal && !engine.playing) engine.drums.play(lane, Tone.immediate());
-  };
-  paintable(g.grid, {
-    start: (e, cell) => {
-      if (!cell) return false;
-      touched = false;
-      const lane = DRUM_LANES[Number(cell.dataset.r)].id;
-      paintVal = e.button === 2 ? 0 : song.drums.pattern[lane][Number(cell.dataset.c)] ? 0 : 1;
-      paint(cell);
-    },
-    move: (_e, cell) => paint(cell),
-    end: () => touched && changed(),
-  });
-  refresh();
-
-  view.refresh = refresh;
-  view.playhead = (step) => {
-    g.setHead(step);
-    if (step < 0) return;
-    DRUM_LANES.forEach((lane, i) => {
-      if (song.drums.pattern[lane.id][step] && engine.audible('drums')) flash(pads[i]);
-    });
-  };
-
-  const presets = el('div', { class: 'tool-row' },
-    el('span', { class: 'tool-label' }, 'Hotové rytmy'),
-    ...DRUM_PRESETS.map((p) => el('button', {
-      class: 'chip small',
-      onclick: () => {
-        checkpoint();
-        applyDrumPreset(song, p);
-        changed();
-        toast(`Rytmus ${p.name} – uprav si ho po svém`);
-      },
-    }, p.name)),
-    el('button', { class: 'chip small danger', onclick: () => clearTrack('drums') }, 'Vymazat bicí'));
-
-  return [
-    panelHead('drums'),
-    section('Bicí souprava', soundPicker('drums')),
-    section(null, presets),
-    section('Ťukej', el('div', { class: 'pads drums' }, ...pads)),
-    section('Smyčka', g.wrap),
-    trackKnobs('drums'),
-  ];
-}
-
-function clearTrack(t) {
-  checkpoint();
-  if (t === 'drums') for (const l of DRUM_LANES) song.drums.pattern[l.id].fill(0);
-  else if (t === 'chords') song.chords.beats.fill(null);
-  else song[t].notes.fill(null);
-  changed();
-}
-
-// ---------- chords ----------
-
-function chordDown(i) {
-  pen = i;
-  view.markPen?.();
-  const notes = voiceChord(palette()[i]);
-  engine.noteOn('chords', notes);
-  if (recording()) {
-    checkpoint('rec-chords');
-    const abs = Math.round(engine.heardStepFloat() / 4);
-    chordRec = { idx: i, start: abs, writes: [] };
-    writeChordBeat(abs);
-  }
-  return () => {
-    engine.noteOff('chords', notes);
-    if (chordRec?.idx === i) finishChordRec();
-  };
-}
-
-function writeChordBeat(abs) {
-  const beats = song.chords.beats;
-  const b = mod(abs, beats.length);
-  if (chordRec.writes.some((w) => w.abs === abs)) return;
-  chordRec.writes.push({ abs, b, prev: beats[b] });
-  beats[b] = chordRec.idx;
-  changed();
-}
-
-// Called on every beat while a chord pad is held during recording.
-function continueChordRec() {
-  if (!engine.playing) return;
-  writeChordBeat(Math.round(engine.heardStepFloat() / 4));
-}
-
-// Release slightly after a beat started should not claim that beat.
-function finishChordRec() {
-  const end = Math.round(engine.heardStepFloat() / 4);
-  const rec = chordRec;
-  chordRec = null;
-  if (!rec) return;
-  for (const w of [...rec.writes].reverse()) {
-    if (w.abs > rec.start && w.abs >= end) song.chords.beats[w.b] = w.prev;
-  }
-  changed();
-}
-
-function chordsPanel() {
-  const pal = palette();
-  const padEls = pal.map((ch, i) => pad({
-    code: PAD_KEYS[i], label: ch.name, sub: ch.minor ? 'smutnější' : 'veselejší', color: CHORD_COLORS[i], cls: 'chord-pad', down: () => chordDown(i),
-  }));
-  const eraser = pad({
-    code: PAD_KEYS[pal.length], label: 'Ticho', sub: 'guma', cls: 'chord-pad eraser',
+  const recBtn = pad({
+    code: HOLD_KEY,
+    label: 'Hold',
+    sub: 'to record',
+    cls: `hold ${t}`,
     down: () => {
-      pen = null;
-      view.markPen?.();
-      return null;
-    },
-  });
-  const markPen = () => {
-    padEls.forEach((p, i) => p.classList.toggle('selected', pen === i));
-    eraser.classList.toggle('selected', pen === null);
-  };
-  view.markPen = markPen;
-  markPen();
-
-  const beatsN = song.steps / 4;
-  const g = stepGrid({ rows: 1, cols: beatsN, stepPerCol: 4, rowLabels: [el('div', { class: 'row-label' }, 'Akordy')], cls: 'chord-grid' });
-  const blocks = [];
-  const refresh = () => {
-    for (const b of blocks.splice(0)) b.remove();
-    const beats = song.chords.beats;
-    let i = 0;
-    while (i < beatsN) {
-      const c = beats[i];
-      let run = 1;
-      while (i + run < beatsN && beats[i + run] === c) run++;
-      if (c !== null) {
-        const blk = el('div', { class: 'chord-block', style: { gridRow: '1', gridColumn: `${i + 1} / span ${run}`, '--chord': CHORD_COLORS[c] } },
-          el('span', {}, pal[c].name), run > 1 ? el('small', {}, `${run} doby`) : null);
-        g.grid.insertBefore(blk, g.grid.lastChild);
-        blocks.push(blk);
+      rec = { from: null, row: knobAt[t][1], gated: touching && !slotTrack, wrote: false };
+      engine.setLive(t, live());
+      const begin = () => {
+        if (rec.gated && !touching) return;
+        rec.from = engine.heardStepFloat();
+        rec.wrote = true;
+        if (slotTrack) writeSlot(rec.from);
+      };
+      // Right away when the loop runs, so short chopped taps on the button all become notes.
+      if (engine.playing) begin();
+      else {
+        const mine = rec;
+        startLoop().then(() => rec === mine && begin());
       }
-      i += run;
-    }
-  };
-  let touched = false;
-  let paintVal = 0;
-  const paint = (cell) => {
-    const b = Number(cell.dataset.c);
-    if (song.chords.beats[b] === paintVal) return;
-    if (!touched) checkpoint();
-    touched = true;
-    song.chords.beats[b] = paintVal;
-    refresh();
-  };
-  paintable(g.grid, {
-    start: (e, cell) => {
-      if (!cell) return false;
-      touched = false;
-      paintVal = e.button === 2 ? null : pen;
-      paint(cell);
-      if (paintVal !== null && !engine.playing) engine.tracks.chords.inst.play(voiceChord(pal[paintVal]), Tone.immediate(), 0.6, 0.7);
+      return () => {
+        if (rec?.from != null && engine.playing && !slotTrack) commitNote(t, rec.row, rec.from, engine.heardStepFloat());
+        const wrote = rec?.wrote;
+        rec = null;
+        if (!touching) engine.clearLive(t);
+        if (wrote) tourDid(t);
+      };
     },
-    move: (_e, cell) => paint(cell),
-    end: () => touched && changed(),
   });
-  refresh();
-  view.refresh = refresh;
-  let lastChord = null;
-  view.playhead = (step) => {
-    g.setHead(step);
-    const c = step < 0 ? null : chordAtStep(song, step);
-    if (c !== lastChord) {
-      lastChord = c;
-      padEls.forEach((p, i) => p.classList.toggle('sounding', i === c));
-    }
+
+  // While recording, every step takes the knob's energy, and drums/chords take its row per slot.
+  view.onStep = (step) => {
+    if (step < 0 || rec?.from == null) return;
+    dispatch({ k: 'x', t, s: step, v: [knobAt[t][0]] }, { tag: `rec-${t}` });
+    if (slotTrack && step % SLOT[t] === 0) writeSlot(step);
   };
 
-  const progressions = el('div', { class: 'tool-row' },
-    el('span', { class: 'tool-label' }, 'Hotové postupy'),
-    ...MOODS[song.mood].progressions.map((p) => el('button', {
-      class: 'chip small',
-      onclick: () => {
-        checkpoint();
-        applyProgression(song, p.chords);
-        changed();
-        toast(`${p.name}: ${p.chords.map((c) => pal[c].name).join(' → ')}`);
-      },
-    }, p.name, el('small', {}, p.chords.map((c) => pal[c].name).join(' '))),
-    ),
-    el('button', { class: 'chip small danger', onclick: () => clearTrack('chords') }, 'Vymazat akordy'));
+  const canvas = strokeCanvas({
+    rows: ROWS[t],
+    steps: LOOP,
+    color: colorOf,
+    state: () => ({
+      pos: loopPos(),
+      row: knobAt[t][1],
+      x: knobAt[t][0],
+      holding: !!rec,
+      stepSec: engine.stepSeconds(),
+      recorded: segments(t, toRow),
+      pending: rec?.from != null && engine.playing
+        ? [{ from: rec.from, to: engine.heardStepFloat(), row: slotTrack ? knobAt[t][1] : rec.row, w: knobAt[t][0] }]
+        : [],
+    }),
+  });
 
-  const styles = chips(CHORD_STYLES, song.chords.style, (id) => {
-    checkpoint();
-    song.chords.style = id;
-    changed({ panel: true });
-  }, 'style-chips');
-
+  view.knob = knob;
   return [
-    panelHead('chords'),
-    section('Nástroj', soundPicker('chords')),
-    section('Jak hrát', styles),
-    section(null, progressions),
-    section(`Akordy v náladě „${MOODS[song.mood].name}“`, el('div', { class: 'pads chords' }, ...padEls, eraser)),
-    section('Smyčka', g.wrap),
-    trackKnobs('chords'),
+    el('section', { class: 'block stroke-stage' }, canvas, el('div', { class: 'stroke-controls' }, knob, recBtn)),
   ];
 }
 
-// ---------- bass & lead ----------
+// ---------- voice: a launchpad of your own clips ----------
 
-function melodicDown(t, r) {
-  const stepNow = engine.playing ? mod(Math.round(engine.heardStepFloat()), song.steps) : 0;
-  const midi = engine.resolveRow(t, r, stepNow);
-  engine.noteOn(t, midi);
-  const startF = recording() ? engine.heardStepFloat() : null;
-  return () => {
-    engine.noteOff(t, midi);
-    if (startF === null || !engine.playing) return;
-    const start = Math.round(startF);
-    const len = Math.min(song.steps, Math.max(1, Math.round(engine.heardStepFloat()) - start));
-    checkpoint(`rec-${t}`);
-    writeNote(t, mod(start, song.steps), r, len);
-    changed();
+const VOICE_COLORS = ['#d4ff3a', '#4dffb8', '#36d6ff', '#9b6bff', '#ff3ea5', '#ffb03a'];
+const VOICE_GRID = [4, 5, 2, 3, 0, 1]; // on screen top row first; pad 0 is bottom left, like the line
+const VOICE_KEYS = ['KeyZ', 'KeyX', 'KeyA', 'KeyS', 'KeyQ', 'KeyW']; // by pad, same layout
+const mic = new Mic();
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Count-in clicks go straight to the speakers: the music output is hushed while recording.
+let beeper = null;
+function beep(note) {
+  beeper ??= new Tone.Synth({
+    oscillator: { type: 'sine' },
+    envelope: { attack: 0.002, decay: 0.09, sustain: 0, release: 0.05 },
+    volume: -10,
+  }).toDestination();
+  beeper.triggerAttackRelease(note, 0.09);
+}
+
+function voicePanel() {
+  const t = 'voice';
+  let active = null; // pad sounding right now
+  let lastPad = 0;
+  let recording = false; // the hold button is down
+  let held = null; // { row, from } a pad press being written into the loop
+  let wrote = false; // this hold of the record button put a clip into the loop
+
+  const commitHeld = () => {
+    if (held && engine.playing) commitNote(t, held.row, held.from, engine.heardStepFloat());
+    held = null;
   };
-}
+  const startHeld = (row) => {
+    commitHeld();
+    if (recording && engine.playing) {
+      held = { row, from: engine.heardStepFloat() };
+      wrote = true;
+    }
+  };
 
-// Mono track: a new note replaces whatever starts inside its length.
-function writeNote(t, s, row, len) {
-  const notes = song[t].notes;
-  len = Math.min(len, notes.length - s);
-  for (let k = 1; k < len; k++) notes[s + k] = null;
-  notes[s] = { row, len };
-}
+  // Hold a pad: the music goes quiet, a count-in of three beats, then talk until you let go.
+  // The loop stays stopped meanwhile: the phone records and plays back better that way.
+  const overlay = el('div', { class: 'take-overlay' }, el('b'), el('span'), el('i', { class: 'take-meter' }, el('i')));
+  const show = (big, small, cls) => {
+    overlay.className = `take-overlay show ${cls}`;
+    overlay.querySelector('b').textContent = big;
+    overlay.querySelector('span').textContent = small;
+  };
 
-function melodicPanel(t) {
-  const rows = melodicRows(t, song.mood, song.key, song.safe);
-  const R = rows.length;
-  const rowName = (row) => (row.kind === 'note' ? pcName(row.midi, song.key, MOODS[song.mood].scale) : row.label);
-  const rowOct = (row) => (row.kind === 'note' ? String(Math.floor(row.midi / 12) - 1) : 'akordu');
-  const color = TRACK_COLOR[t];
-
-  const padEls = rows.map((row, r) => pad({
-    code: PAD_KEYS[r], label: rowName(row), sub: rowOct(row), color,
-    cls: row.kind !== 'note' ? 'special' : '', down: () => melodicDown(t, r),
-  }));
-
-  // Display top = highest note; special bass rows at the very bottom.
-  const disp = (r) => R - 1 - r;
-  const labels = rows.map((_, i) => {
-    const row = rows[R - 1 - i];
-    return el('div', { class: `row-label${row.kind !== 'note' ? ' special' : ''}` },
-      el('span', { class: 'note-name' }, rowName(row)), el('small', {}, rowOct(row)));
-  });
-  const g = stepGrid({ rows: R, cols: song.steps, rowLabels: labels, cls: `note-grid ${t}` });
-  let noteEls = [];
-  const refresh = () => {
-    for (const n of noteEls) n.remove();
-    noteEls = [];
-    song[t].notes.forEach((n, s) => {
-      if (!n) return;
-      const len = Math.min(n.len, song.steps - s);
-      const ne = el('div', {
-        class: `note${rows[n.row]?.kind !== 'note' ? ' special' : ''}`,
-        dataset: { s },
-        style: { gridRow: String(disp(n.row) + 1), gridColumn: `${s + 1} / span ${len}` },
-      });
-      g.grid.insertBefore(ne, g.grid.lastChild);
-      noteEls.push(ne);
+  function takeClip(i, b) {
+    engine.stop();
+    showPlaying();
+    engine.hush(true);
+    b.classList.add('taking');
+    b.querySelector('.pad-sub').textContent = 'keep holding';
+    let released = false;
+    let talking = false;
+    const opening = mic.start().then(() => true, (err) => {
+      console.warn(err);
+      toast(window.isSecureContext ? 'This needs the microphone. Allow it in the browser settings.' : 'The microphone only works over https://', 4000);
+      return false;
     });
-  };
 
-  let drag = null;
-  paintable(g.grid, {
-    start: (e, cell) => {
-      const noteEl = e.target.closest('.note');
-      checkpoint();
-      if (noteEl || (e.button === 2 && cell)) {
-        // Click on a note (or right click anywhere on its row start) deletes it.
-        const s = noteEl ? Number(noteEl.dataset.s) : Number(cell.dataset.c);
-        song[t].notes[s] = null;
-        refresh();
-        changed();
-        return false;
+    (async () => {
+      const beat = engine.stepSeconds() * 4 * 1000;
+      for (const n of [3, 2, 1]) {
+        if (released) return;
+        show(String(n), 'get ready', 'count');
+        beep(n === 1 ? 'A5' : 'E5');
+        await sleep(beat);
       }
-      const s = Number(cell.dataset.c);
-      const r = R - 1 - Number(cell.dataset.r);
-      writeNote(t, s, r, 1);
-      drag = { s, r };
-      refresh();
-      if (!engine.playing) engine.tracks[t].inst.play(engine.resolveRow(t, r, s), Tone.immediate(), 0.25, 0.85);
-      return true;
-    },
-    move: (_e, cell) => {
-      if (!drag) return;
-      const len = Math.max(1, Number(cell.dataset.c) - drag.s + 1);
-      writeNote(t, drag.s, drag.r, len);
-      refresh();
-    },
-    end: () => {
-      drag = null;
-      changed();
+      if (released) return;
+      show('…', 'opening the mic', 'count');
+      if (!(await opening) || released) return;
+      mic.mark();
+      talking = true;
+      show('REC', 'talk now, let go when done', 'rec');
+      b.querySelector('.pad-sub').textContent = 'recording';
+      const meter = overlay.querySelector('.take-meter i');
+      let lvl = 0;
+      const draw = () => {
+        if (!talking) return;
+        lvl = Math.max(mic.level, lvl * 0.9);
+        meter.style.width = `${Math.min(100, Math.sqrt(lvl) * 110)}%`;
+        requestAnimationFrame(draw);
+      };
+      draw();
+    })();
+
+    return async () => {
+      released = true;
+      const wasTalking = talking;
+      talking = false;
+      overlay.className = 'take-overlay';
+      const data = (await opening) ? mic.stop() : null;
+      engine.hush(false);
+      if (!wasTalking) {
+        if (data) toast('Keep holding the pad through the count-in, then talk.', 3000);
+        return renderPanel();
+      }
+      const clip = trimTake(data, mic.rate);
+      if (!clip) toast('Nothing heard. Hold the pad and talk.', 3000);
+      else {
+        const id = newClipId();
+        addClip(id, clip, mic.rate);
+        dispatch({ k: 'pad', i, clip: id });
+        toast('Clip recorded. Tap the pad to play it.');
+      }
+      renderPanel();
+    };
+  }
+
+  const pads = VOICE_GRID.map((i) => {
+    const clip = song.voice.pads[i];
+    const empty = !clip;
+    const b = pad({
+      code: VOICE_KEYS[i],
+      label: '',
+      sub: empty ? 'hold & talk' : '',
+      cls: `vpad${empty ? ' empty' : ''}`,
+      down: (e) => {
+        // The mic badge in the corner of a full pad records it again.
+        if (empty || e?.target?.closest?.('.rerec')) return takeClip(i, b);
+        active = lastPad = i;
+        engine.setLive(t, { row: i, x: 0.5 });
+        if (engine.playing) startHeld(i);
+        else startLoop().then(() => active === i && startHeld(i));
+        return () => {
+          if (held?.row === i) commitHeld();
+          if (active === i) {
+            active = null;
+            engine.clearLive(t);
+          }
+        };
+      },
+    });
+    b.style.setProperty('--c', VOICE_COLORS[i]);
+    b.dataset.pad = i;
+    const wave = !empty && outline(clip);
+    if (wave) {
+      const bars = wave.map((v, k) => `<rect x="${k * 4}" y="${12 - 11 * v}" width="2.4" height="${Math.max(1, 22 * v)}" rx="1"/>`).join('');
+      b.querySelector('.pad-label').innerHTML = `<svg class="wave" viewBox="0 0 ${wave.length * 4} 24" preserveAspectRatio="none">${bars}</svg>`;
+      b.append(el('span', { class: 'rerec', title: 'Hold to record again', 'aria-label': 'Hold to record again' }, svgIcon(ICONS.voice)));
+    } else if (empty) {
+      b.querySelector('.pad-label').innerHTML = `<svg viewBox="0 0 24 24">${ICONS.voice}</svg>`;
+    }
+    return b;
+  });
+
+  const recBtn = pad({
+    code: HOLD_KEY,
+    label: 'Hold',
+    sub: 'to record',
+    cls: 'hold voice',
+    down: () => {
+      recording = true;
+      wrote = false;
+      startLoop().then(() => recording && active !== null && startHeld(active));
+      return () => {
+        commitHeld();
+        recording = false;
+        if (wrote) tourDid(t);
+      };
     },
   });
-  refresh();
-  view.refresh = refresh;
 
-  const nowChord = el('span', { class: 'now-chord' }, '–');
-  let lastChord;
-  const lightChordTones = (c) => {
-    const pal = palette();
-    const pcs = c === null || c === undefined ? [] : pal[c].intervals.map((iv) => (pal[c].rootPc + iv) % 12);
-    rows.forEach((row, r) => {
-      const lit = row.kind !== 'note' ? c !== null && c !== undefined : pcs.includes(row.midi % 12);
-      labels[disp(r)].classList.toggle('chord-tone', lit);
-      padEls[r].classList.toggle('chord-tone', lit);
-    });
-    nowChord.textContent = c === null || c === undefined ? '–' : pal[c].name;
-    nowChord.style.setProperty('--chord', c === null || c === undefined ? 'transparent' : CHORD_COLORS[c]);
-  };
-  view.playhead = (step) => {
-    g.setHead(step);
-    const c = chordAtStep(song, Math.max(0, step));
-    if (c !== lastChord) {
-      lastChord = c;
-      lightChordTones(c);
-    }
-    if (step >= 0) {
-      const n = song[t].notes[step];
-      if (n && engine.audible(t)) flash(padEls[n.row]);
-    }
-  };
-  lightChordTones(chordAtStep(song, Math.max(0, playStep)));
-
-  const tools = el('div', { class: 'tool-row' },
-    el('button', {
-      class: 'chip small accent',
-      onclick: () => {
-        checkpoint();
-        if (t === 'bass') generateBass(song);
-        else generateLead(song);
-        changed();
-        toast(song.chords.beats.every((c) => c === null) ? 'Tip: s akordy to bude znít ještě líp' : 'Vymyšleno – klikni znovu pro jinou verzi');
-      },
-    }, '🎲 Vymysli za mě'),
-    el('label', { class: 'switch', title: 'Pentatonika: 5 tónů, které zní dobře vždycky' },
-      el('input', {
-        type: 'checkbox', checked: song.safe,
-        onchange: (e) => {
-          checkpoint();
-          const prev = { mood: song.mood, key: song.key, safe: song.safe };
-          song.safe = e.target.checked;
-          remapMelodies(song, prev);
-          changed({ panel: true });
-        },
-      }),
-      el('span', {}, 'Jen bezpečné tóny')),
-    el('button', { class: 'chip small danger', onclick: () => clearTrack(t) }, t === 'bass' ? 'Vymazat basu' : 'Vymazat melodii'));
+  const canvas = strokeCanvas({
+    rows: ROWS[t],
+    steps: LOOP,
+    color: (row) => VOICE_COLORS[row],
+    state: () => ({
+      pos: loopPos(),
+      row: active ?? lastPad,
+      x: 0.5,
+      holding: recording,
+      stepSec: engine.stepSeconds(),
+      recorded: segments(t),
+      pending: held && engine.playing ? [{ from: held.from, to: engine.heardStepFloat(), row: held.row, w: 0.5 }] : [],
+    }),
+  });
 
   return [
-    panelHead(t),
-    section('Nástroj', soundPicker(t)),
-    section(null, tools),
-    section(null, el('div', { class: 'pads-head' }, el('h3', {}, 'Hraj'), el('div', { class: 'now' }, 'Teď hraje akord ', nowChord)),
-      el('div', { class: `pads melodic ${t}` }, ...padEls)),
-    section('Smyčka', g.wrap),
-    trackKnobs(t),
+    el('section', { class: 'block stroke-stage' }, canvas, overlay, el('div', { class: 'stroke-controls' }, el('div', { class: 'launchpad' }, ...pads), recBtn)),
   ];
 }
 
 // ---------- fx ----------
 
-const STUTTERS = [
-  { len: 4, name: 'Zaseknout', sub: 'po dobách' },
-  { len: 2, name: 'Zaseknout', sub: 'po osminách' },
-  { len: 1, name: 'Zaseknout', sub: 'po šestnáctinách' },
-];
-
 function fxPanel() {
-  const dj = knob({
-    label: 'DJ filtr', value: perf.dj, min: -1, max: 1, dflt: 0, bipolar: true, size: 'lg', color: 'var(--c-fx)',
-    format: (v) => (v < -0.02 ? 'tlumí výšky' : v > 0.02 ? 'ubírá basy' : 'vypnuto'),
-    onInput: (v) => {
-      perf.dj = v;
-      engine.setDjFilter(v);
-      xy.set(v / 2 + 0.5, perf.echo);
-    },
-  });
-  const echo = knob({
-    label: 'Ozvěna', value: perf.echo, dflt: 0, size: 'lg', color: 'var(--c-fx)', format: fmtPct,
-    onInput: (v) => {
-      perf.echo = v;
-      engine.setEcho(v);
-      xy.set(perf.dj / 2 + 0.5, v);
-    },
-  });
-  const master = knob({
-    label: 'Celková hlasitost', value: perf.master, dflt: 0.9, size: 'lg', color: 'var(--c-fx)', format: fmtPct,
-    onInput: (v) => {
-      perf.master = v;
-      engine.setMasterVol(v);
-    },
-  });
   const xy = xyPad({
-    labels: { left: '◀ tlumit výšky', right: 'ubrat basy ▶', top: '▲ ozvěna', bottom: '' },
+    labels: { left: '◀ muffle', right: 'thin ▶', top: '▲ squelch', bottom: '' },
     home: [0.5, 0],
-    spring: () => perf.spring,
-    onMove: (x, y) => {
-      perf.dj = (x - 0.5) * 2;
-      perf.echo = y;
-      engine.setDjFilter(perf.dj);
-      engine.setEcho(perf.echo);
-      dj.set(perf.dj);
-      echo.set(perf.echo);
-    },
+    onMove: (x, y) => engine.setXY((x - 0.5) * 2, y),
+    onRelease: () => tourDid('fx'),
   });
-  xy.set(perf.dj / 2 + 0.5, perf.echo);
 
-  const stutterPads = STUTTERS.map((st, i) => pad({
-    code: PAD_KEYS[i], label: st.name, sub: st.sub, color: 'var(--c-fx)', cls: 'fx-pad',
+  const hold = (code, label, sub, on, off) => pad({
+    code, label, sub, cls: 'fx',
     down: () => {
-      engine.setStutter(st.len);
-      return () => engine.setStutter(null);
+      on();
+      return off;
     },
-  }));
-
-  const strips = TRACKS.map((t) => {
-    const mk = (key, label) => knob({
-      label, value: song.mix[t][key], color: TRACK_COLOR[t], format: fmtPct, size: 'sm',
-      onInput: (v) => {
-        checkpoint(`knob-${t}-${key}`);
-        engine.setMix(t, key, v);
-        save();
-      },
-    });
-    return el('div', { class: `strip${engine.audible(t) ? '' : ' muted'}`, style: { '--c': TRACK_COLOR[t] } },
-      el('div', { class: 'strip-name' }, TRACK_NAME[t]),
-      mk('vol', 'Hlasitost'), mk('cutoff', 'Jas'), mk('reverb', 'Hall'), mk('delay', 'Ozvěna'),
-      el('div', { class: 'strip-btns' },
-        el('button', { class: `ov-btn${song.mute[t] ? ' on' : ''}`, onclick: () => toggleMute(t) }, 'M'),
-        el('button', { class: `ov-btn solo${song.solo[t] ? ' on' : ''}`, onclick: () => toggleSolo(t) }, 'S')));
   });
+  const holds = [
+    hold(PAD_KEYS[0], 'Stutter', 'eighths', () => engine.setStutter(2), () => engine.setStutter(null)),
+    hold(PAD_KEYS[1], 'Stutter', 'fast', () => engine.setStutter(1), () => engine.setStutter(null)),
+    hold(PAD_KEYS[2], 'Breakdown', 'let go = drop', () => engine.setBreakdown(true), () => engine.setBreakdown(false)),
+  ];
 
-  const spring = el('label', { class: 'switch' },
-    el('input', { type: 'checkbox', checked: perf.spring, onchange: (e) => (perf.spring = e.target.checked) }),
-    el('span', {}, 'Po puštění vrátit na střed'));
-  const reset = el('button', {
-    class: 'chip small',
-    onclick: () => {
-      perf.dj = 0;
-      perf.echo = 0;
-      engine.setDjFilter(0);
-      engine.setEcho(0);
-      renderPanel();
-    },
-  }, 'Vypnout efekty');
+  const mix = TRACKS.map((t) => el('div', { class: `mix-row${song.mute[t] ? ' muted' : ''}`, style: { '--c': TAB[t].color } },
+    el('span', { class: 'mix-name' }, TAB[t].name),
+    el('input', {
+      type: 'range', min: 0, max: 1, step: 0.01, value: song.vol[t], 'aria-label': `${TAB[t].name} volume`,
+      oninput: (e) => dispatch({ k: 'vol', t, v: Number(e.target.value) }, { tag: `vol-${t}` }),
+    }),
+    el('button', { class: `mute${song.mute[t] ? ' on' : ''}`, onclick: () => dispatch({ k: 'mute', t, v: !song.mute[t] }) },
+      song.mute[t] ? 'muted' : 'on')));
 
-  view.refresh = null;
-  view.playhead = null;
+  // Tempo: a slider, plus nudges for exact steps.
+  const bpmOut = el('output', { class: 'tempo-value' }, String(song.bpm));
+  const setBpm = (v) => {
+    v = Math.max(BPM_RANGE[0], Math.min(BPM_RANGE[1], v));
+    if (!dispatch({ k: 'bpm', v }, { tag: 'bpm' })) return;
+    bpmOut.textContent = String(v);
+    slider.value = v;
+  };
+  const slider = el('input', {
+    type: 'range', min: BPM_RANGE[0], max: BPM_RANGE[1], step: 1, value: song.bpm, 'aria-label': 'Tempo',
+    oninput: (e) => setBpm(Number(e.target.value)),
+  });
+  const tempo = el('div', { class: 'tempo' },
+    el('button', { class: 'chip', 'aria-label': 'Slower', onclick: () => setBpm(song.bpm - 1) }, '−'),
+    el('div', { class: 'tempo-main' }, bpmOut, el('small', {}, 'BPM'), slider),
+    el('button', { class: 'chip', 'aria-label': 'Faster', onclick: () => setBpm(song.bpm + 1) }, '+'));
 
   return [
-    panelHead('fx'),
-    el('div', { class: 'fx-layout' },
-      section('Efektová plocha', xy, el('div', { class: 'tool-row' }, spring, reset)),
-      el('div', { class: 'fx-side' },
-        section('Knoflíky', el('div', { class: 'knobs' }, dj, echo, master)),
-        section('Drž pro efekt', el('div', { class: 'pads fx' }, ...stutterPads)))),
-    section('Mixpult', el('div', { class: 'mixer' }, ...strips)),
+    el('section', { class: 'block xy-block' }, xy),
+    el('section', { class: 'block' }, el('h3', {}, 'Hold'), el('div', { class: 'pads pads-3' }, ...holds)),
+    el('section', { class: 'block' }, el('h3', {}, 'Tempo'), tempo),
+    el('section', { class: 'block' }, el('h3', {}, 'Levels'), el('div', { class: 'mix' }, ...mix)),
   ];
 }
 
@@ -1110,22 +763,24 @@ function fxPanel() {
 
 function renderPanel() {
   padHandlers.clear();
-  view = { ovHeads: view.ovHeads };
-  const build = { drums: drumsPanel, chords: chordsPanel, bass: () => melodicPanel('bass'), lead: () => melodicPanel('lead'), fx: fxPanel }[tab];
+  for (const t of TRACKS) engine.clearLive(t);
+  mic.stop();
+  view = {};
+  renderHeader();
   const p = $('panel');
-  p.style.setProperty('--c', TRACK_COLOR[tab]);
-  p.replaceChildren(...build());
-  view.playhead?.(playStep);
+  p.style.setProperty('--c', TAB[tab].color);
+  p.replaceChildren(...(tab === 'fx' ? fxPanel() : tab === 'voice' ? voicePanel() : trackPanel(tab)).filter(Boolean));
+  p.scrollTop = 0;
+  if (tour) requestAnimationFrame(tourUpdate);
 }
 
 function renderAll() {
-  updateHeader();
+  renderSong();
   renderTabs();
-  renderOverview();
   renderPanel();
 }
 
-// ---------- keyboard ----------
+// ---------- keyboard (desktop) ----------
 
 function isTyping(e) {
   const t = e.target;
@@ -1142,6 +797,13 @@ window.addEventListener('keydown', (e) => {
     return;
   }
   if (e.altKey) return;
+  // Arrows move the knob (left/right in tenths).
+  const arrow = { ArrowUp: [0, 1], ArrowDown: [0, -1], ArrowLeft: [-0.1, 0], ArrowRight: [0.1, 0] }[e.code];
+  if (arrow && view.knob) {
+    e.preventDefault();
+    view.knob.nudge(...arrow);
+    return;
+  }
   const h = padHandlers.get(e.code);
   if (e.repeat) {
     if (h || e.code === 'Space') e.preventDefault();
@@ -1150,15 +812,11 @@ window.addEventListener('keydown', (e) => {
   if (e.code === 'Space') {
     e.preventDefault();
     togglePlay();
-  } else if (/^Digit[1-5]$/.test(e.code)) {
+  } else if (/^Digit[1-6]$/.test(e.code)) {
     setTab(TABS[Number(e.code.slice(5)) - 1].id);
-  } else if (e.code === 'KeyR') {
-    toggleRec();
-  } else if (e.code === 'KeyM') {
-    toggleMetro();
   } else if (h && !heldKeys.has(e.code)) {
     e.preventDefault();
-    Tone.start();
+    unlockAudio();
     h.el.classList.add('pressed');
     heldKeys.set(e.code, { release: h.down(), el: h.el });
   }
@@ -1180,60 +838,172 @@ window.addEventListener('blur', () => {
   }
 });
 
-// Real key labels for the user's layout (Czech keyboard shows ů and § instead of ; and ').
 navigator.keyboard?.getLayoutMap?.().then((map) => {
-  for (const code of PAD_KEYS) {
+  for (const code of [...PAD_KEYS, ...VOICE_KEYS]) {
     const l = map.get(code);
     if (l) keyLabels[code] = l.toUpperCase();
   }
   renderPanel();
 }).catch(() => {});
 
-// ---------- welcome ----------
+// ---------- first run: full screen, then a tour ----------
 
-function welcome() {
-  const close = () => {
-    Tone.start();
-    dlg.close();
-    dlg.remove();
-  };
-  const dlg = el('dialog', { class: 'welcome' },
-    el('h2', {}, 'Ahoj! Tohle je ', el('span', { class: 'logo' }, 'mixpult')),
-    el('p', {}, 'Složíš tady písničku za pár minut, i když nevíš nic o hudbě. Smyčka se pořád dokola přehrává a ty do ní postupně přidáváš:'),
-    el('ol', { class: 'steps' },
-      ...TABS.map((t) => el('li', { style: { '--c': t.color } }, el('b', {}, t.name), ' – ',
-        { drums: 'ťukáš rytmus', chords: 'vybíráš akordy, které k sobě ladí', bass: 'hraješ basu, nic nezní falešně', lead: 'přidáš melodii', fx: 'hraješ si na DJe s efekty' }[t.id]))),
-    el('div', { class: 'welcome-actions' },
-      el('button', {
-        class: 'btn-primary',
-        onclick: () => {
-          close();
-          setTab('drums');
-          toast('Zmáčkni mezerník a začni ťukat');
-        },
-      }, 'Začít od nuly'),
-      el('button', {
-        class: 'btn-secondary',
-        onclick: async () => {
-          close();
-          replaceSong(demoSong());
-          await engine.ready;
-          await engine.start();
-          updateHeader();
-        },
-      }, 'Pustit ukázku')));
-  document.body.append(dlg);
-  dlg.showModal();
+const isIOS = /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const SHARE_ICON = '<svg viewBox="0 0 24 24"><path d="M12 3v12M8 7l4-4 4 4M6 11H5v10h14V11h-1"/></svg>';
+const PLUS_ICON = '<svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="4"/><path d="M12 8v8M8 12h8"/></svg>';
+
+// Before anything plays: how to get rid of the browser bars. An iPhone can only do it from the
+// home screen (that copy of the app starts its own first run there); elsewhere one tap does it.
+function fullscreenGuide() {
+  return new Promise((resolve) => {
+    const request = document.documentElement.requestFullscreen ?? document.documentElement.webkitRequestFullscreen;
+    const done = () => {
+      dlg.close();
+      dlg.remove();
+      resolve();
+    };
+    const li = (html) => {
+      const item = el('li');
+      item.innerHTML = `<span>${html}</span>`;
+      return item;
+    };
+    const ios = isIOS && !request;
+    const dlg = el('dialog', { class: 'welcome' },
+      el('h2', {}, el('span', { class: 'logo' }, 'mixpult')),
+      el('p', {}, 'Night techno from your fingertips. It plays best full screen, without the browser around it.'),
+      ios
+        ? el('ol', { class: 'guide-steps' },
+          li(`Tap ${SHARE_ICON} <b>Share</b> (behind <b>•••</b> in Safari)`),
+          li(`Choose ${PLUS_ICON} <b>Add to Home Screen</b>`),
+          li('Open <b>Mixpult</b> from your home screen'))
+        : null,
+      el('div', { class: 'welcome-actions' },
+        ios
+          ? el('button', { class: 'btn-secondary', onclick: done }, 'Stay in Safari')
+          : [
+            el('button', { class: 'btn-secondary', onclick: done }, 'Not now'),
+            el('button', {
+              class: 'btn-primary',
+              onclick: async () => {
+                try {
+                  await request.call(document.documentElement, { navigationUI: 'hide' });
+                  await screen.orientation?.lock?.('portrait').catch(() => {});
+                } catch { /* stays in the browser */ }
+                done();
+              },
+            }, 'Go full screen'),
+          ]));
+    document.body.append(dlg);
+    dlg.showModal();
+    document.activeElement?.blur(); // no focus ring on the first button for a touch
+  });
+}
+
+// The tour: tap play, then ghost thumbs show the move (left thumb plays, right thumb holds record);
+// once you have recorded something the next tab blinks, and opening it ends the tour.
+const TOUR_KEY = 'mixpult.tour';
+const coach = new Coach();
+let tour = null; // { started, did: the tab you recorded on } while the tour runs
+
+function startTour() {
+  tour = { started: engine.playing, did: null };
+  tourUpdate();
+}
+
+function endTour(msg) {
+  tour = null;
+  coach.clear();
+  try { localStorage.setItem(TOUR_KEY, 'done'); } catch { /* ignore */ }
+  if (msg) toast(msg, 3000);
+}
+
+function tourDid(t) {
+  if (!tour?.started || tour.did) return;
+  tour.did = t;
+  tourUpdate();
+}
+
+function tourUpdate() {
+  coach.clear();
+  if (!tour) return;
+  const skip = () => endTour();
+  if (!tour.started) {
+    if (!engine.playing) {
+      coach.pulse($('play'));
+      coach.tip('Tap play', $('play'), 'below', skip);
+      return;
+    }
+    tour.started = true;
+  }
+  const panel = $('panel');
+  if (tour.did) {
+    if (tab !== tour.did) return endTour('That’s it, the rest works the same. Have fun!');
+    const i = (TABS.findIndex((x) => x.id === tab) + 1) % TABS.length;
+    const next = TABS[i];
+    const btn = $('tabs').children[i];
+    coach.pulse(btn);
+    coach.tip(`Next: ${next.name}`, btn, 'above', skip);
+    return;
+  }
+  const hold = panel.querySelector('.pad.hold');
+  if (tab === 'fx') {
+    const xy = panel.querySelector('.xy-pad');
+    coach.hands({ left: xy, move: 'drag' });
+    coach.tip('Drag around, then let go', xy, 'over', skip);
+  } else if (tab === 'voice') {
+    const clip = panel.querySelector('.vpad:not(.empty)');
+    coach.hands({ left: clip ?? panel.querySelector('.vpad'), right: clip ? hold : null, move: 'tap' });
+    coach.tip(clip ? 'Hold record, tap a clip' : 'Hold a pad and talk', panel.querySelector('canvas'), 'over', skip);
+  } else {
+    coach.hands({ left: panel.querySelector('.knob-pad'), right: hold, move: 'slide' });
+    coach.tip('Hold record, slide the pad', panel.querySelector('canvas'), 'over', skip);
+  }
+}
+
+// The ghost thumbs step aside while you touch the screen.
+document.addEventListener('pointerdown', () => coach.away(true), true);
+document.addEventListener('pointerup', () => coach.away(false), true);
+document.addEventListener('pointercancel', () => coach.away(false), true);
+
+// Fetches the preset clips a song uses but this device has not stored yet.
+async function loadPresetClips() {
+  const missing = Object.entries(PRESET_CLIPS).filter(([id]) => song.voice.pads.includes(id) && !clips.has(id));
+  await Promise.all(missing.map(async ([id, file]) => {
+    try {
+      const res = await fetch((import.meta.env.BASE_URL ?? '/') + file);
+      const buf = await Tone.getContext().rawContext.decodeAudioData(await res.arrayBuffer());
+      const data = trimTake(buf.getChannelData(0), buf.sampleRate);
+      if (data) addClip(id, data, buf.sampleRate);
+    } catch (err) {
+      console.warn('Preset clip not loaded', id, err);
+    }
+  }));
 }
 
 // ---------- boot ----------
 
 Tone.getContext().lookAhead = 0.05;
-// Empty loop would play silence; the click gives a beginner something to tap along to.
-engine.metronome = isEmpty(song);
+// One screen, exactly: see body in style.css. --app-h follows the visible height (it shrinks
+// with Safari's bars). The status bar is opaque on purpose: with black-translucent, iOS 26 sizes a
+// home-screen app's view a status bar short and leaves that strip blank under the tab bar.
+function fitScreen() {
+  const h = window.visualViewport?.height ?? window.innerHeight;
+  document.documentElement.style.setProperty('--app-h', `${h}px`);
+}
+fitScreen();
+window.addEventListener('resize', fitScreen);
+window.visualViewport?.addEventListener('resize', fitScreen);
+window.addEventListener('orientationchange', () => setTimeout(fitScreen, 300));
 initHeader();
 renderAll();
-if (isEmpty(song)) welcome();
+loadClips(new Set(song.voice.pads.filter(Boolean)))
+  .then(loadPresetClips)
+  .then(() => tab === 'voice' && renderPanel());
+if (!stored) {
+  // Touch screens outside an installed app first learn how to go full screen; desktops skip it.
+  const guide = !homeScreen && matchMedia('(pointer: coarse)').matches;
+  (guide ? fullscreenGuide() : Promise.resolve()).then(startTour);
+}
 
 // Handle for automated tests in the browser console.
-window.__mixpult = { engine, get song() { return song; }, Tone, Engine, renderWav, replaceSong, demoSong, normalizeSong, SOUND_IDS };
+window.__mixpult = { engine, get song() { return song; }, Tone, renderWav, setSong, demoSong, newSong, dispatch, LOOP, addClip };

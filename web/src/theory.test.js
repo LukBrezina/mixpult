@@ -1,144 +1,104 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { MOODS, SCALES, chordPalette, voiceChord, melodicRows, chordBassNote, registerRoot } from './theory.js';
-import { newSong, normalizeSong, resizeSong, remapMelodies } from './song.js';
-import { applyProgression, generateBass, generateLead, demoSong, setRandom, DRUM_PRESETS, applyDrumPreset } from './patterns.js';
+import { CHORDS, LEAD_ROWS, BASS_ROWS, chordPcs, voiceChord, leadNote, bassNote } from './theory.js';
+import { newSong, apply, normalizeSong, activeNote, LOOP, ROWS, SLOT } from './song.js';
+import { DRUM_GROOVES, DRUM_LANES, layerLevel } from './patterns.js';
+import { demoSong } from './demo.js';
 
-const SOUNDS = { drums: ['tr909', 'tr808'], chords: ['piano', 'pad'], bass: ['pluck', 'sub'], lead: ['square'] };
+test('chords are colour chords in F minor', () => {
+  assert.deepEqual(CHORDS.map((c) => c.name), ['Fm9', 'Dbmaj7', 'Abmaj7', 'Ebadd9', 'Bbm7', 'Cm7']);
+});
 
-test('palettes: six chords per mood, every chord tone inside the scale', () => {
-  for (const [id, mood] of Object.entries(MOODS)) {
-    for (let key = 0; key < 12; key++) {
-      const pal = chordPalette(id, key);
-      assert.equal(pal.length, 6, `${id} ${key}`);
-      const scalePcs = SCALES[mood.scale].steps.map((s) => (s + key) % 12);
-      for (const ch of pal) {
-        for (const iv of ch.intervals) assert.ok(scalePcs.includes((ch.rootPc + iv) % 12), `${id} ${key} ${ch.name}`);
-      }
-      for (const p of mood.progressions) for (const c of p.chords) assert.ok(c < pal.length);
+test('nothing can clash: every bass and lead row is a tone of the chord under it', () => {
+  for (const chord of CHORDS) {
+    const tones = chordPcs(chord);
+    const voiced = voiceChord(chord);
+    assert.ok(voiced.at(-1) - voiced[0] < 12 && voiced.length >= 3);
+    for (let b = 0; b < BASS_ROWS; b++) {
+      const bass = bassNote(chord, b);
+      assert.ok(tones.includes(bass % 12), `bass row ${b} over ${chord.name}`);
+      assert.ok(bass >= 29 && bass < 64);
     }
+    for (let r = 0; r < LEAD_ROWS; r++) assert.ok(tones.includes(leadNote(chord, r) % 12), `${chord.name} lead row ${r}`);
   }
 });
 
-test('chord names', () => {
-  assert.deepEqual(chordPalette('happy', 0).map((c) => c.name), ['C', 'Dm', 'Em', 'F', 'G', 'Am']);
-  assert.deepEqual(chordPalette('sad', 9).map((c) => c.name), ['Am', 'C', 'Dm', 'Em', 'F', 'G']);
-  assert.deepEqual(chordPalette('chill', 5).map((c) => c.name), ['Fmaj7', 'Gm7', 'Am7', 'Bbmaj7', 'C7', 'Dm7']);
-  assert.deepEqual(chordPalette('funky', 7).map((c) => c.name), ['Gm7', 'Am7', 'Bbmaj7', 'C7', 'Dm7', 'Fmaj7']);
-});
-
-test('voicing stays in one octave window and keeps the chord tones', () => {
-  for (const ch of chordPalette('night', 2)) {
-    const v = voiceChord(ch);
-    assert.ok(v[v.length - 1] - v[0] < 12);
-    assert.ok(v.every((n) => n >= 54 && n < 66));
-    assert.deepEqual(new Set(v.map((n) => n % 12)), new Set(ch.intervals.map((i) => (ch.rootPc + i) % 12)));
+test('rows go up, and the same row stays in a similar place across chords', () => {
+  for (const chord of CHORDS) {
+    for (let r = 1; r < LEAD_ROWS; r++) assert.ok(leadNote(chord, r) > leadNote(chord, r - 1));
+    for (let r = 1; r < BASS_ROWS; r++) assert.ok(bassNote(chord, r) > bassNote(chord, r - 1));
   }
-});
-
-test('melodic rows are in scale, ascending, and in a sane register', () => {
-  for (const mood of Object.keys(MOODS)) {
-    for (let key = 0; key < 12; key++) {
-      for (const safe of [true, false]) {
-        const scale = SCALES[MOODS[mood].scale];
-        const pcs = (safe ? scale.penta : scale.steps).map((s) => (s + key) % 12);
-        for (const t of ['bass', 'lead']) {
-          const notes = melodicRows(t, mood, key, safe).filter((r) => r.kind === 'note').map((r) => r.midi);
-          assert.ok(notes.every((n) => pcs.includes(n % 12)));
-          assert.ok(notes.every((n, i) => i === 0 || n > notes[i - 1]));
-          if (t === 'bass') assert.ok(notes[0] >= 28 && notes[0] < 40);
-          else assert.ok(notes[0] >= 57 && notes[0] < 69 && notes[notes.length - 1] <= 93);
-          assert.equal(notes[0] % 12, key);
-        }
-      }
-    }
+  for (let r = 0; r < LEAD_ROWS; r++) {
+    const notes = CHORDS.map((c) => leadNote(c, r));
+    assert.ok(Math.max(...notes) - Math.min(...notes) <= 6, `row ${r} spread ${notes}`);
   }
+  // Same knob height, different chord, (usually) a different note: that is the point.
+  assert.notEqual(leadNote(CHORDS[0], 1), leadNote(CHORDS[5], 1));
 });
 
-test('chord-following bass notes are the chord root / fifth', () => {
-  const pal = chordPalette('happy', 0);
-  const g = pal[4]; // G
-  assert.equal(chordBassNote(g, 0, 'root') % 12, 7);
-  assert.equal(chordBassNote(g, 0, 'fifth') - chordBassNote(g, 0, 'root'), 7);
-  assert.equal(registerRoot(0, 28), 36);
-});
-
-test('normalizeSong rejects junk and keeps valid data', () => {
-  const s = normalizeSong({ steps: 999, bpm: 'x', mood: 'nope', drums: { kit: '<script>', pattern: { kick: [1, 'a', 0] } }, bass: { notes: [{ row: 99, len: 2 }, { row: 2, len: 500 }] } }, SOUNDS);
-  assert.equal(s.steps, 32);
-  assert.equal(s.bpm, 100);
-  assert.equal(s.mood, 'happy');
-  assert.equal(s.drums.kit, 'tr909');
-  assert.deepEqual(s.drums.pattern.kick.slice(0, 3), [1, 1, 0]);
-  assert.equal(s.drums.pattern.kick.length, 32);
-  assert.equal(s.bass.notes[0], null);
-  assert.deepEqual(s.bass.notes[1], { row: 2, len: 32 });
-  const demo = demoSong();
-  assert.deepEqual(normalizeSong(JSON.parse(JSON.stringify(demo)), SOUNDS).lead.notes, demo.lead.notes);
-  assert.equal(normalizeSong(null, SOUNDS).steps, 32);
-});
-
-test('resize tiles when growing and cuts when shrinking', () => {
-  const s = demoSong();
-  const kick = [...s.drums.pattern.kick];
-  resizeSong(s, 64);
-  assert.equal(s.drums.pattern.kick.length, 64);
-  assert.deepEqual(s.drums.pattern.kick.slice(32), kick);
-  assert.equal(s.chords.beats.length, 16);
-  assert.notEqual(s.bass.notes[32], s.bass.notes[0]); // copied, not shared
-  resizeSong(s, 16);
-  assert.equal(s.lead.notes.length, 16);
-  assert.ok(s.lead.notes.every((n, i) => !n || i + n.len <= 16));
-});
-
-test('progressions spread over the loop', () => {
+test('apply validates ops', () => {
   const s = newSong();
-  applyProgression(s, [0, 4, 5, 3]);
-  assert.deepEqual(s.chords.beats, [0, 0, 4, 4, 5, 5, 3, 3]);
-  resizeSong(s, 16);
-  applyProgression(s, [0, 4, 5, 3]);
-  assert.deepEqual(s.chords.beats, [0, 4, 5, 3]);
+  assert.equal(apply(s, { k: 'slot', t: 'chords', i: 15, v: 3 }), true);
+  assert.equal(s.chords.slots[15], 3);
+  assert.equal(apply(s, { k: 'slot', t: 'chords', i: LOOP / SLOT.chords, v: 0 }), false);
+  assert.equal(apply(s, { k: 'slot', t: 'drums', i: 0, v: ROWS.drums }), false);
+  assert.equal(apply(s, { k: 'slot', t: 'bass', i: 0, v: 0 }), false);
+  assert.equal(apply(s, { k: 'x', t: 'lead', s: LOOP - 2, v: [0.2, 0.333] }), true);
+  assert.deepEqual(s.lead.x.slice(LOOP - 2), [0.2, 0.33]);
+  assert.equal(apply(s, { k: 'x', t: 'lead', s: LOOP - 1, v: [0.2, 0.3] }), false);
+  assert.equal(apply(s, { k: 'x', t: 'lead', s: 0, v: [2] }), false);
+  assert.equal(apply(s, { k: 'note', t: 'lead', s: 0, note: { row: LEAD_ROWS, len: 1 } }), false);
+  assert.equal(apply(s, { k: 'note', t: 'drums', s: 0, note: { row: 0, len: 1 } }), false);
+  assert.equal(apply(s, { k: 'vol', t: 'bass', v: 3 }), false);
+  // Voice pads hold clip ids, nothing else.
+  assert.equal(apply(s, { k: 'pad', i: 0, clip: '../x' }), false);
+  assert.equal(apply(s, { k: 'pad', i: ROWS.voice, clip: 'ab12' }), false);
+  assert.equal(apply(s, { k: 'pad', i: 2, clip: 'ab12' }), true);
+  assert.equal(apply(s, { k: 'note', t: 'voice', s: 0, note: { row: 2, len: 4 } }), true);
+  assert.equal(normalizeSong(JSON.parse(JSON.stringify(s))).voice.pads[2], 'ab12');
+  assert.equal(apply(s, { k: 'bpm', v: 128 }), true);
+  assert.equal(s.bpm, 128);
+  assert.equal(apply(s, { k: 'bpm', v: 300 }), false);
+  assert.equal(apply(s, { k: 'bpm', v: 128.5 }), false);
+  assert.equal(apply(s, { k: 'whatever' }), false);
+  assert.equal(apply(s, null), false);
 });
 
-test('remap on key change transposes, on safe toggle keeps pitch', () => {
-  const s = demoSong();
-  const before = s.lead.notes.map((n) => n && n.row);
-  const prev = { mood: s.mood, key: s.key, safe: s.safe };
-  s.key = 2;
-  remapMelodies(s, prev);
-  assert.deepEqual(s.lead.notes.map((n) => n && n.row), before); // same degrees in D
-  const rowsPenta = melodicRows('lead', s.mood, s.key, true);
-  const pitches = s.lead.notes.map((n) => n && rowsPenta[n.row].midi);
-  s.safe = false;
-  remapMelodies(s, { mood: s.mood, key: s.key, safe: true });
-  const rowsFull = melodicRows('lead', s.mood, s.key, false);
-  assert.deepEqual(s.lead.notes.map((n) => n && rowsFull[n.row].midi), pitches); // penta is a subset of the full scale
+test('mono notes: a long note swallows notes that start inside it, len is capped', () => {
+  const s = newSong();
+  apply(s, { k: 'note', t: 'lead', s: 4, note: { row: 1, len: 1 } });
+  apply(s, { k: 'note', t: 'lead', s: 6, note: { row: 2, len: 1 } });
+  apply(s, { k: 'note', t: 'lead', s: 2, note: { row: 3, len: 6 } });
+  assert.deepEqual(s.lead.notes.slice(0, 8).map((n) => n && n.row), [null, null, 3, null, null, null, null, null]);
+  apply(s, { k: 'note', t: 'lead', s: LOOP - 2, note: { row: 0, len: 9 } });
+  assert.equal(s.lead.notes[LOOP - 2].len, 2);
+  assert.deepEqual(activeNote(s.lead.notes, 5), { start: 2, note: s.lead.notes[2] });
+  assert.equal(activeNote(s.lead.notes, 8), null);
+  apply(s, { k: 'clear', t: 'lead' });
+  assert.ok(s.lead.notes.every((n) => n === null));
 });
 
-test('generators produce valid notes that fit the chords', () => {
-  let seed = 1;
-  setRandom(() => ((seed = (seed * 16807) % 2147483647) / 2147483647));
-  for (let i = 0; i < 50; i++) {
-    const s = demoSong();
-    s.mood = Object.keys(MOODS)[i % 5];
-    s.key = i % 12;
-    generateBass(s);
-    generateLead(s);
-    applyDrumPreset(s, DRUM_PRESETS[i % DRUM_PRESETS.length]);
-    const rows = melodicRows('lead', s.mood, s.key, s.safe);
-    const pal = chordPalette(s.mood, s.key);
-    s.lead.notes.forEach((n, step) => {
-      if (!n) return;
-      assert.ok(n.row >= 0 && n.row < rows.length && n.len >= 1);
-      if (step % 4 === 0) {
-        const c = pal[s.chords.beats[Math.floor(step / 4)]];
-        const pcs = c.intervals.map((iv) => (c.rootPc + iv) % 12);
-        assert.ok(pcs.includes(rows[n.row].midi % 12), 'strong beat lands on a chord tone');
-      }
-    });
-    assert.ok(s.bass.notes.some(Boolean));
-    const bassRows = melodicRows('bass', s.mood, s.key, s.safe).length;
-    assert.ok(s.bass.notes.every((n) => !n || (n.row < bassRows && n.len >= 1)));
+test('normalizeSong: round trip and junk', () => {
+  const demo = demoSong();
+  assert.deepEqual(normalizeSong(JSON.parse(JSON.stringify(demo))), demo);
+  assert.deepEqual(normalizeSong({ v: 2, bpm: 120 }), newSong());
+  const junk = normalizeSong({ v: 3, chords: { slots: [99, 1, 'x', 2] }, lead: { notes: [{ row: -1, len: 2 }, { row: 2, len: 3 }], x: [5, 0.1] } });
+  assert.deepEqual(junk.chords.slots.slice(0, 4), [0, 1, 0, 2]);
+  assert.equal(junk.lead.notes[0], null);
+  assert.deepEqual(junk.lead.notes[1], { row: 2, len: 3 });
+  assert.deepEqual(junk.lead.x.slice(0, 2), [0.5, 0.1]);
+});
+
+test('drum grooves and energy layers', () => {
+  assert.equal(DRUM_GROOVES.length, ROWS.drums);
+  for (const g of DRUM_GROOVES) {
+    for (const l of DRUM_LANES) assert.equal(g[l.id].length, 16);
+    assert.ok(g.kick.some(Boolean));
   }
-  setRandom(Math.random);
+  // Far left: only the kick. Far right: everything. More energy never removes a layer.
+  for (const l of DRUM_LANES) {
+    assert.equal(layerLevel(l.layer, 0), l.layer === 0 ? 1 : 0);
+    assert.equal(layerLevel(l.layer, 1), 1);
+    for (let x = 0; x < 1; x += 0.05) assert.ok(layerLevel(l.layer, x + 0.05) >= layerLevel(l.layer, x));
+  }
 });

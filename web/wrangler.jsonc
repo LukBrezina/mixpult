@@ -1,0 +1,11 @@
+// Static site on Cloudflare: `npm run deploy` builds dist/ and uploads it.
+{
+  "name": "mixpult",
+  "compatibility_date": "2026-10-23",
+  "assets": {
+    "directory": "./dist"
+  },
+  "routes": [
+    { "pattern": "mixpult.brezinovi.sk", "custom_domain": true }
+  ]
+}

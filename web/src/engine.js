@@ -1,19 +1,33 @@
 // Audio engine: mixer, effects and the step sequencer that plays the song object.
 // The engine reads the song on every step, so edits are heard on the next pass of the loop.
+// While a knob is touched, that track plays "live" from the knob instead of from the song.
 import * as Tone from 'tone';
-import { DrumKit, createInstrument } from './sounds.js';
-import { DRUM_LANES, TRACKS, chordAtStep } from './song.js';
-import { chordPalette, voiceChord, melodicRows, chordBassNote } from './theory.js';
+import { DrumKit, LAYERS, createLayer, createSub, createVoiceChain } from './sounds.js';
+import { clips } from './voice.js';
+import { TRACKS, LOOP, SLOT, activeNote } from './song.js';
+import { DRUM_LANES, DRUM_GROOVES, layerLevel } from './patterns.js';
+import { CHORDS, voiceChord, leadNote, bassNote } from './theory.js';
 
 export const sliderToDb = (v) => (v <= 0.001 ? -Infinity : 40 * Math.log10(v));
-export const cutoffHz = (v) => 60 * Math.pow(20000 / 60, v);
-const resoQ = (v) => 0.7 + v * 11;
 
-// Drum dynamics: off-beat hats a bit softer gives a natural groove for free.
+// Equal-power crossfade over three layers: x = 0 → first, 0.5 → middle, 1 → last.
+export function xfade(x) {
+  return [0, 1, 2].map((i) => {
+    const d = Math.abs(x * 2 - i);
+    return d >= 1 ? 0 : Math.cos((d * Math.PI) / 2);
+  });
+}
+
+// Off-beat hats a bit softer gives a natural groove for free.
 function drumVelocity(lane, step) {
   if (lane === 'hat' || lane === 'openhat') return step % 4 === 0 ? 1 : step % 2 === 0 ? 0.78 : 0.6;
   return step % 4 === 0 ? 1 : 0.9;
 }
+
+const MELODIC = ['bass', 'lead'];
+const LAYERED = ['chords', ...MELODIC];
+const perTrack = (v) => Object.fromEntries(TRACKS.map((t) => [t, v]));
+const CHORD_SLOT = SLOT.chords;
 
 export class Engine {
   constructor(song) {
@@ -23,164 +37,134 @@ export class Engine {
     this.onStep = null; // UI callback(step), called in sync with the audio
     this.counter = 0;
     this.stutter = null;
-    this.held = { chords: 0, bass: 0, lead: 0 };
-    this.lastDrumMonitor = {};
-    this.scheduledDrum = {};
-    this.metronome = false;
+    this.breakdown = false;
+    this.live = perTrack(null); // { row, x } while a knob is touched
+    this.liveMidi = perTrack(null);
+    this.x = perTrack(null); // energy currently applied
+    this.clipSources = new Map(); // voice clips playing right now -> their end time
+    this.offline = Tone.getContext() instanceof Tone.OfflineContext;
+    this.padDirty = true; // the pad must be (re)started at the next slot
     this.latency = 0; // extra user calibration, seconds
 
-    // Master: echo throw -> DJ filters -> glue compressor -> limiter.
+    // Master: DJ filters -> glue compressor -> limiter.
     this.master = new Tone.Gain(1);
-    this.echo = new Tone.FeedbackDelay({ delayTime: '8n.', feedback: 0.45, wet: 0 });
     this.djHP = new Tone.Filter({ type: 'highpass', frequency: 10, rolloff: -24, Q: 1 });
     this.djLP = new Tone.Filter({ type: 'lowpass', frequency: 20000, rolloff: -24, Q: 1 });
-    this.comp = new Tone.Compressor({ threshold: -16, ratio: 2.5, attack: 0.015, release: 0.25, knee: 8 });
+    this.comp = new Tone.Compressor({ threshold: -16, ratio: 2.5, attack: 0.015, release: 0.2, knee: 8 });
     this.limiter = new Tone.Limiter(-1);
-    this.out = new Tone.Volume(0);
-    this.master.chain(this.echo, this.djHP, this.djLP, this.comp, this.limiter, this.out, Tone.getDestination());
+    // Soft clipper after the limiter: linear up to 0.7, then rounds off so peaks never pass 0 dBFS.
+    this.clip = new Tone.WaveShaper((x) => {
+      const a = Math.abs(x);
+      return a < 0.7 ? x : Math.sign(x) * (0.7 + 0.29 * Math.tanh((a - 0.7) / 0.29));
+    }, 4096);
+    this.out = new Tone.Volume(-1);
+    this.master.chain(this.djHP, this.djLP, this.comp, this.limiter, this.clip, this.out, Tone.getDestination());
 
-    this.reverb = new Tone.Reverb({ decay: 2.6, preDelay: 0.02, wet: 1 });
-    this.reverbIn = new Tone.Filter({ type: 'highpass', frequency: 250 });
-    this.reverbIn.chain(this.reverb, this.master);
-    this.delay = new Tone.FeedbackDelay({ delayTime: '8n.', feedback: 0.38, wet: 1 });
-    this.delayIn = new Tone.Filter({ type: 'bandpass', frequency: 1800, Q: 0.4 });
-    this.delayIn.chain(this.delay, this.master);
+    // Everything except drums goes through this bus, which ducks on every kick (sidechain pump).
+    this.music = new Tone.Gain(1).connect(this.master);
 
+    this.reverb = new Tone.Reverb({ decay: 3.8, preDelay: 0.03, wet: 1 });
+    this.reverbIn = new Tone.Filter({ type: 'highpass', frequency: 300 });
+    this.reverbIn.chain(this.reverb, this.music);
+    this.delay = new Tone.FeedbackDelay({ delayTime: '8n.', feedback: 0.35, wet: 1 });
+    this.delayIn = new Tone.Filter({ type: 'bandpass', frequency: 2000, Q: 0.5 });
+    this.delayIn.chain(this.delay, this.music);
+
+    const SENDS = { drums: [0.06, 0], chords: [0.3, 0.12], bass: [0, 0], lead: [0.3, 0.28], voice: [0.32, 0.2] };
     this.tracks = {};
     for (const t of TRACKS) {
-      const filter = new Tone.Filter({ type: 'lowpass', frequency: 20000, rolloff: -24, Q: 0.7 });
       const channel = new Tone.Channel();
-      const rev = new Tone.Gain(0);
-      const del = new Tone.Gain(0);
-      filter.connect(channel);
-      channel.connect(this.master);
-      channel.connect(rev);
-      channel.connect(del);
-      rev.connect(this.reverbIn);
-      del.connect(this.delayIn);
-      this.tracks[t] = { filter, channel, rev, del, inst: null };
+      channel.connect(t === 'drums' ? this.master : this.music);
+      const [rev, del] = SENDS[t];
+      if (rev) channel.connect(new Tone.Gain(rev).connect(this.reverbIn));
+      if (del) channel.connect(new Tone.Gain(del).connect(this.delayIn));
+      this.tracks[t] = { channel };
     }
 
-    this.click = new Tone.Synth({
-      oscillator: { type: 'sine' },
-      envelope: { attack: 0.001, decay: 0.04, sustain: 0, release: 0.03 },
-      volume: -14,
-    }).connect(this.limiter);
-
-    this.drums = new DrumKit(song.drums.kit, this.tracks.drums.filter);
-    for (const t of ['chords', 'bass', 'lead']) this.setSound(t, song[t].sound, false);
-    this.applyAll();
+    this.drums = new DrumKit(this.tracks.drums.channel);
+    this.voice = createVoiceChain();
+    this.voice.output.connect(this.tracks.voice.channel);
+    for (const t of LAYERED) {
+      const tr = this.tracks[t];
+      tr.layers = LAYERS[t].map((id) => {
+        const inst = createLayer(t, id);
+        const gain = new Tone.Gain(0).connect(tr.channel);
+        inst.output.connect(gain);
+        return { inst, gain };
+      });
+    }
+    this.tracks.bass.sub = createSub();
+    this.tracks.bass.sub.output.connect(this.tracks.bass.channel);
+    for (const t of TRACKS) this.setX(t, song[t].x[0], 0);
+    this.applyMix();
 
     this.transport.scheduleRepeat((time) => this.tick(time), '16n', 0);
   }
 
   get ready() {
-    return Promise.all([this.drums.ready, this.reverb.ready, ...['chords', 'bass', 'lead'].map((t) => this.tracks[t].inst.ready)]);
+    return Promise.all([this.drums.ready, this.reverb.ready]);
   }
 
   // ---------- song / mixer ----------
 
   setSong(song) {
     this.song = song;
-    if (this.drums.kit !== song.drums.kit) this.drums.load(song.drums.kit);
-    for (const t of ['chords', 'bass', 'lead']) {
-      if (this.tracks[t].soundId !== song[t].sound) this.setSound(t, song[t].sound, false);
-    }
-    this.applyAll();
+    this.sync({ k: 'slot', t: 'chords' });
   }
 
-  // resetEnv: take the preset's own attack/release (when the user picks a new sound).
-  setSound(track, id, resetEnv = true) {
-    const tr = this.tracks[track];
-    const old = tr.inst;
-    if (old) {
-      old.silence(Tone.now());
-      setTimeout(() => old.dispose(), 3000);
-    }
-    const inst = createInstrument(track, id);
-    inst.output.connect(tr.filter);
-    tr.inst = inst;
-    tr.soundId = id;
-    const mix = this.song.mix[track];
-    if (resetEnv || mix.attack === undefined) {
-      mix.attack = inst.defaults.attack;
-      mix.release = inst.defaults.release;
-    }
-    inst.setEnv(mix.attack, mix.release);
-    inst.setGlide(mix.glide ?? 0);
-    return inst.ready;
+  // Bring the mixer in line with the song after an op.
+  sync(op) {
+    this.applyMix();
+    if (op?.k === 'slot' && op.t === 'chords') this.retriggerPad();
   }
 
-  setKit(kit) {
-    return this.drums.load(kit);
-  }
-
-  applyAll() {
-    for (const t of ['chords', 'bass', 'lead']) {
-      const mix = this.song.mix[t];
-      if (mix.attack === undefined || mix.release === undefined) {
-        mix.attack = this.tracks[t].inst.defaults.attack;
-        mix.release = this.tracks[t].inst.defaults.release;
-      }
+  applyMix() {
+    if (Math.round(this.transport.bpm.value) !== this.song.bpm) {
+      this.transport.bpm.value = this.song.bpm;
+      // The delay was set in note values: keep it on the beat at the new tempo.
+      this.delay.delayTime.rampTo(this.transport.toSeconds('8n.'), 0.1);
     }
     for (const t of TRACKS) {
-      for (const [k, v] of Object.entries(this.song.mix[t])) this.setMix(t, k, v);
-    }
-    for (const lane of DRUM_LANES) this.drums.setLaneVol(lane.id, this.song.drums.laneVol[lane.id]);
-    this.applyMutes();
-    this.transport.bpm.value = this.song.bpm;
-    this.setSwing(this.song.swing);
-  }
-
-  setMix(track, key, v) {
-    const tr = this.tracks[track];
-    const mix = this.song.mix[track];
-    mix[key] = v;
-    switch (key) {
-      case 'vol': tr.channel.volume.rampTo(sliderToDb(v), 0.05); break;
-      case 'cutoff': tr.filter.frequency.rampTo(cutoffHz(v), 0.05); break;
-      case 'reso': tr.filter.Q.rampTo(resoQ(v), 0.05); break;
-      case 'reverb': tr.rev.gain.rampTo(v, 0.05); break;
-      case 'delay': tr.del.gain.rampTo(v * 0.8, 0.05); break;
-      case 'attack':
-      case 'release': tr.inst?.setEnv(mix.attack, mix.release); break;
-      case 'glide': tr.inst?.setGlide(v); break;
-      case 'tune': this.drums.setTune(v); break;
+      const tr = this.tracks[t];
+      tr.channel.volume.rampTo(sliderToDb(this.song.vol[t]), 0.05);
+      tr.channel.mute = this.song.mute[t];
     }
   }
 
   audible(track) {
-    const anySolo = TRACKS.some((t) => this.song.solo[t]);
-    return anySolo ? this.song.solo[track] : !this.song.mute[track];
+    return !this.song.mute[track];
   }
 
-  applyMutes() {
-    for (const t of TRACKS) this.tracks[t].channel.mute = !this.audible(t);
+  // Left/right energy: crossfades the three layers of a track (drums use it per hit).
+  setX(t, x, time) {
+    if (this.x[t] !== null && Math.abs(x - this.x[t]) < 0.004) return;
+    this.x[t] = x;
+    if (!this.tracks[t].layers) return; // drums use it per hit, voice not at all
+    xfade(x).forEach((g, i) => this.tracks[t].layers[i].gain.gain.setTargetAtTime(g, time, 0.025));
   }
 
-  setSwing(v) {
-    this.transport.swing = v;
-    this.transport.swingSubdivision = '16n';
-  }
-
-  // -1 = lowpass all the way down, 0 = off, +1 = highpass all the way up.
-  setDjFilter(x) {
-    const lp = x < 0 ? 20000 * Math.pow(140 / 20000, -x) : 20000;
-    const hp = x > 0 ? 20 * Math.pow(7000 / 20, x) : 10;
-    const q = 1 + Math.abs(x) * 3;
+  // XY pad. x: -1 = lowpass down, 0 = off, +1 = highpass up. y: 0..1 resonance.
+  setXY(x, y) {
+    const lp = x < 0 ? 20000 * Math.pow(160 / 20000, -x) : 20000;
+    const hp = x > 0 ? 20 * Math.pow(6000 / 20, x) : 10;
+    const q = 0.8 + y * 9;
     this.djLP.frequency.rampTo(lp, 0.04);
     this.djHP.frequency.rampTo(hp, 0.04);
     this.djLP.Q.rampTo(q, 0.04);
     this.djHP.Q.rampTo(q, 0.04);
   }
 
-  setEcho(y) {
-    this.echo.wet.rampTo(y * 0.55, 0.05);
-    this.echo.feedback.rampTo(0.3 + y * 0.35, 0.05);
+  // Beat repeat: while held, the first `len` steps of the current beat play over and over.
+  setStutter(len) {
+    const was = this.stutter;
+    this.stutter = len ? { len, anchor: null, n: 0 } : null;
+    if (len && !was) this.tracks.chords.layers[0].inst.silence(Tone.immediate()); // the long pad gives way to the repeats
+    if (was && !len) this.retriggerPad(); // the pad comes back right away, not at the next slot
   }
 
-  setMasterVol(v) {
-    this.out.volume.rampTo(sliderToDb(v), 0.05);
+  setBreakdown(on) {
+    this.breakdown = on;
+    if (on) this.silenceTrack('bass', Tone.now());
   }
 
   // ---------- transport ----------
@@ -194,6 +178,7 @@ export class Engine {
     await Tone.start();
     if (this.playing) return;
     this.counter = 0;
+    this.padDirty = true;
     this.transport.position = 0;
     this.transport.start('+0.06');
     this._playing = true;
@@ -203,174 +188,282 @@ export class Engine {
     this._playing = false;
     this.transport.stop();
     const now = Tone.now();
-    for (const t of ['chords', 'bass', 'lead']) this.tracks[t].inst.silence(now);
+    for (const t of LAYERED) this.silenceTrack(t, now);
+    this.stopClips(now);
+    this.liveMidi = perTrack(null);
     this.draw.cancel();
     this.onStep?.(-1);
+  }
+
+  // Silences everything at the very end, reverb and delay tails too (while the mic records).
+  hush(on) {
+    this.out.volume.rampTo(on ? -80 : -1, on ? 0.12 : 0.05);
   }
 
   stepSeconds() {
     return this.transport.toSeconds('16n');
   }
 
-  // Loop step the listener hears right now (fractional, not wrapped). Used for live recording.
+  // Loop step the listener hears right now (fractional, counting up from the start, not wrapped).
   heardStepFloat() {
     const ctx = Tone.getContext().rawContext;
     const lat = (ctx.outputLatency || 0) + (ctx.baseLatency || 0) + this.latency;
     const ticks = this.transport.getTicksAtTime(Tone.immediate() - lat);
-    return ticks / (this.transport.PPQ / 4);
+    return Math.max(0, ticks / (this.transport.PPQ / 4));
   }
 
-  setStutter(len) {
-    this.stutter = len ? { len, anchor: null } : null;
+  heardStep() {
+    return this.playing ? Math.floor(this.heardStepFloat()) % LOOP : 0;
+  }
+
+  chordIndexAt(step) {
+    if (this.live.chords) return this.live.chords.row;
+    return this.song.chords.slots[Math.floor((((step % LOOP) + LOOP) % LOOP) / CHORD_SLOT)];
+  }
+
+  chordAt(step) {
+    return CHORDS[this.chordIndexAt(step)];
+  }
+
+  noteFor(track, row, step) {
+    const chord = this.chordAt(step);
+    return track === 'bass' ? bassNote(chord, row) : leadNote(chord, row);
   }
 
   // ---------- sequencer ----------
 
   tick(time) {
-    const song = this.song;
-    const steps = song.steps;
-    let step = this.counter % steps;
+    let step = this.counter % LOOP;
     this.counter++;
-    if (this.stutter) {
-      if (this.stutter.anchor === null) this.stutter.anchor = step - (step % this.stutter.len);
-      step = this.stutter.anchor + ((step - this.stutter.anchor + steps) % steps) % this.stutter.len;
+    const st = this.stutter;
+    let sliceStart = false;
+    if (st) {
+      // From the start of the beat, where the kick is, so the repeat always has a punch.
+      if (st.anchor === null) st.anchor = step - (step % 4);
+      sliceStart = st.n % st.len === 0;
+      step = st.anchor + (st.n++ % st.len);
     }
 
-    if (this.audible('drums')) this.tickDrums(step, time);
-    if (this.audible('chords') && !this.held.chords) this.tickChords(step, time);
-    for (const t of ['bass', 'lead']) {
-      if (this.audible(t) && !this.held[t]) this.tickMelodic(t, step, time);
+    for (const t of TRACKS) this.setX(t, this.live[t]?.x ?? this.song[t].x[step], time);
+    if (!this.breakdown) this.tickDrums(step, time);
+    if (st) {
+      if (sliceStart) this.tickRepeat(step, time, st.len * this.stepSeconds());
+    } else {
+      this.tickChords(step, time);
+      if (!this.breakdown) this.tickMelodic('bass', step, time);
+      this.tickMelodic('lead', step, time);
+      this.tickVoice(step, time);
     }
-    if (this.metronome && step % 4 === 0) this.click.triggerAttackRelease(step % 16 === 0 ? 1760 : 1320, 0.03, time);
+
+    // A live note held across a chord change follows the new chord.
+    if (step % CHORD_SLOT === 0) {
+      for (const t of MELODIC) {
+        if (!this.live[t] || this.liveMidi[t] === null) continue;
+        const midi = this.noteFor(t, this.live[t].row, step);
+        if (midi !== this.liveMidi[t]) {
+          this.liveMidi[t] = midi;
+          this.startNote(t, midi, time);
+        }
+      }
+    }
 
     if (this.onStep) this.draw.schedule(() => this.onStep(step), time);
   }
 
-  tickDrums(step, time) {
-    for (const lane of DRUM_LANES) {
-      if (!this.song.drums.pattern[lane.id][step]) continue;
-      // The user just tapped this drum live, do not double it.
-      if (Math.abs(time - (this.lastDrumMonitor[lane.id] ?? -1)) < this.stepSeconds() * 0.6) continue;
-      const src = this.drums.play(lane.id, time, drumVelocity(lane.id, step));
-      if (src) this.scheduledDrum[lane.id] = { src, time };
-    }
+  duck(time) {
+    const g = this.music.gain;
+    g.cancelScheduledValues(time);
+    g.setValueAtTime(0.6, time);
+    g.setTargetAtTime(1, time + 0.015, 0.07);
   }
 
-  chordNotes(step) {
-    const c = chordAtStep(this.song, step);
-    if (c === null || c === undefined) return null;
-    const chord = chordPalette(this.song.mood, this.song.key)[c];
-    return { idx: c, chord, notes: voiceChord(chord) };
+  tickDrums(step, time) {
+    if (!this.audible('drums')) return;
+    const groove = DRUM_GROOVES[this.live.drums?.row ?? this.song.drums.slots[Math.floor(step / SLOT.drums)]];
+    const s = step % 16;
+    if (groove.kick[s]) this.duck(time);
+    for (const lane of DRUM_LANES) {
+      if (!groove[lane.id][s]) continue;
+      const level = layerLevel(lane.layer, this.x.drums);
+      if (level > 0.02) this.drums.play(lane.id, time, drumVelocity(lane.id, s) * level);
+    }
   }
 
   tickChords(step, time) {
-    const cur = this.chordNotes(step);
-    if (!cur) return;
-    const inst = this.tracks.chords.inst;
+    if (!this.audible('chords')) return;
+    const c = this.chordIndexAt(step);
+    const notes = voiceChord(CHORDS[c]);
+    const [pad, stab, arp] = this.tracks.chords.layers;
+    const g = xfade(this.x.chords);
     const sd = this.stepSeconds();
-    const beats = this.song.chords.beats;
-    const beat = Math.floor(step / 4);
-    switch (this.song.chords.style) {
-      case 'hold': {
-        if (step % 4 !== 0 || (beat > 0 && beats[beat - 1] === cur.idx)) return;
-        let run = 1;
-        while (beat + run < beats.length && beats[beat + run] === cur.idx) run++;
-        inst.play(cur.notes, time, run * 4 * sd - 0.02, 0.75);
-        break;
-      }
-      case 'beats':
-        if (step % 4 === 0) inst.play(cur.notes, time, 3 * sd, step % 16 === 0 ? 0.8 : 0.68);
-        break;
-      case 'offbeat':
-        if (step % 4 === 2) inst.play(cur.notes, time, 1.2 * sd, 0.72);
-        break;
-      case 'syncop':
-        if ([0, 3, 6].includes(step % 8)) inst.play(cur.notes, time, 2 * sd, step % 8 === 0 ? 0.8 : 0.66);
-        break;
-      case 'arp': {
-        const arp = [...cur.notes, cur.notes[0] + 12];
-        const note = arp[step % arp.length];
-        inst.play([note], time, sd * 0.9, step % 4 === 0 ? 0.75 : 0.6);
-        break;
-      }
-    }
-  }
+    const s = step % 16;
 
-  resolveRow(track, rowIdx, step) {
-    const row = melodicRows(track, this.song.mood, this.song.key, this.song.safe)[rowIdx];
-    if (!row) return null;
-    if (row.kind === 'note') return row.midi;
-    const cur = this.chordNotes(step);
-    const chord = cur ? cur.chord : chordPalette(this.song.mood, this.song.key)[0];
-    return chordBassNote(chord, this.song.key, row.kind);
+    // Pad: one long chord for as long as it stays the same within the bar. Always played, even when
+    // faded out, so sliding left brings it in smoothly. The live chord is held by setLive instead.
+    if (!this.live.chords && s % CHORD_SLOT === 0 && (s === 0 || this.padDirty || this.chordIndexAt(step - 1) !== c)) {
+      let run = CHORD_SLOT;
+      while (s + run < 16 && this.chordIndexAt(step + run) === c) run += CHORD_SLOT;
+      pad.inst.play(notes, time, run * sd - 0.03, 0.7);
+      this.padDirty = false;
+    }
+    // Stabs on the off-beat (the kick owns the beat), arpeggio on every 16th.
+    if (g[1] > 0.01 && s % 4 === 2) stab.inst.play(notes, time, 1.2 * sd, s === 14 ? 0.85 : 0.75);
+    if (g[2] > 0.01) {
+      const up = [notes[0], notes[1], notes[2], notes[0] + 12];
+      arp.inst.play([up[s % 4]], time, sd * 0.9, s % 4 === 0 ? 0.75 : 0.6);
+    }
   }
 
   tickMelodic(track, step, time) {
+    if (!this.audible(track) || this.live[track]) return;
     const notes = this.song[track].notes;
-    const n = notes[step];
+    let start = step;
+    let n = notes[step];
+    // A long note crossing into a new chord is re-pitched to it, so it never clashes.
+    if (!n && step % CHORD_SLOT === 0) {
+      const act = activeNote(notes, step);
+      if (act) {
+        start = act.start;
+        n = act.note;
+      }
+    }
     if (!n) return;
-    const midi = this.resolveRow(track, n.row, step);
-    if (midi === null) return;
-    // Mono synth: a note must end before the next one starts, otherwise its release cuts the next note.
     let dist = 1;
-    while (dist < notes.length && !notes[(step + dist) % notes.length]) dist++;
-    const len = Math.min(n.len, dist, notes.length - step);
-    const sd = this.stepSeconds();
-    const dur = len * sd - (len >= dist ? 0.008 : 0);
-    const vel = track === 'bass' ? (step % 4 === 0 ? 0.95 : 0.8) : (step % 4 === 0 ? 0.85 : 0.75);
-    this.tracks[track].inst.play(midi, time, dur, vel);
+    while (step + dist < LOOP && !notes[step + dist]) dist++;
+    const len = Math.min(start + n.len - step, dist, CHORD_SLOT - (step % CHORD_SLOT));
+    // Mono synths: end just before the next note, otherwise its release cuts the next one.
+    const dur = len * this.stepSeconds() - (len >= dist ? 0.008 : 0);
+    const vel = step % 4 === 0 ? 0.95 : 0.8;
+    const midi = this.noteFor(track, n.row, step);
+    for (const l of this.tracks[track].layers) l.inst.play(midi, time, dur, vel);
+    this.tracks[track].sub?.play(midi, time, dur, vel);
   }
 
-  // ---------- live playing ----------
-
-  hitDrum(lane) {
-    const now = Tone.immediate();
-    this.lastDrumMonitor[lane] = now;
-    // If the sequencer already scheduled this drum a moment from now, the tap replaces it.
-    const sch = this.scheduledDrum[lane];
-    if (sch && sch.time > now - 0.005 && sch.time - now < this.stepSeconds() * 0.6) {
-      try { sch.src.stop(now); } catch { /* already stopped */ }
+  // One beat-repeat slice: everything that sounds at `step` starts again, whether its note began
+  // there or earlier (otherwise a repeat of the middle of a long note is silence).
+  tickRepeat(step, time, dur) {
+    const len = dur * 0.9;
+    if (this.audible('chords') && !this.live.chords) {
+      const notes = voiceChord(this.chordAt(step));
+      for (const l of this.tracks.chords.layers) l.inst.play(notes, time, len, 0.7);
     }
-    this.drums.play(lane, now, 1);
+    for (const t of MELODIC) {
+      if (!this.audible(t) || this.live[t] || (t === 'bass' && this.breakdown)) continue;
+      const act = activeNote(this.song[t].notes, step);
+      if (!act) continue;
+      const midi = this.noteFor(t, act.note.row, step);
+      for (const l of this.tracks[t].layers) l.inst.play(midi, time, len, 0.9);
+      this.tracks[t].sub?.play(midi, time, len, 0.9);
+    }
+    const v = activeNote(this.song.voice.notes, step);
+    if (v && this.audible('voice') && !this.live.voice) {
+      this.playClip(v.note.row, time, dur, (step - v.start) * this.stepSeconds());
+    }
+    this.padDirty = true;
   }
 
-  // While a pad is held, the sequencer leaves that track alone so the two do not fight.
-  noteOn(track, payload) {
-    const inst = this.tracks[track].inst;
-    const now = Tone.immediate();
-    this.held[track]++;
-    if (track === 'chords') {
-      inst.start(payload, now, 0.8);
-      return;
-    }
-    // Mono tracks: last pressed note wins, releasing it falls back to the one still held.
-    (this.monoStack ??= { bass: [], lead: [] })[track].push(payload);
-    inst.start(payload, now, 0.9);
+  // Voice pads in the loop: a note plays its pad's clip for as long as the pad was held.
+  tickVoice(step, time) {
+    const notes = this.song.voice.notes;
+    const n = notes[step];
+    if (!n || !this.audible('voice') || this.live.voice) return;
+    let dist = 1;
+    while (step + dist < LOOP && !notes[step + dist]) dist++;
+    this.playClip(n.row, time, Math.min(n.len, dist) * this.stepSeconds());
   }
 
-  noteOff(track, payload) {
-    const inst = this.tracks[track].inst;
-    const now = Tone.immediate();
-    this.held[track] = Math.max(0, this.held[track] - 1);
-    if (track === 'chords') {
-      inst.stop(payload, now);
-      return;
+  // One clip at a time, like chopping on a launchpad: a new one cuts the last.
+  playClip(pad, time, dur = Infinity, offset = 0) {
+    const buf = clips.get(this.song.voice.pads[pad]);
+    this.stopClips(time);
+    if (!buf || offset >= buf.duration) return;
+    // Cleaned up here by time, not in onended: an offline render (WAV export) runs the whole
+    // sequencer before rendering a sample, and disposing there would silence every clip.
+    for (const [old, end] of this.clipSources) {
+      if (!this.offline && end < time - 1) {
+        old.dispose();
+        this.clipSources.delete(old);
+      }
     }
-    const stack = this.monoStack[track];
-    const wasTop = stack[stack.length - 1] === payload;
-    const i = stack.lastIndexOf(payload);
-    if (i >= 0) stack.splice(i, 1);
-    if (!stack.length) inst.stop(payload, now);
-    else if (wasTop) inst.start(stack[stack.length - 1], now, 0.9);
+    const src = new Tone.ToneBufferSource({ context: this.voice.input.context, url: buf, fadeIn: 0.003, fadeOut: 0.03 });
+    src.connect(this.voice.input);
+    const len = Math.min(dur, buf.duration - offset);
+    this.clipSources.set(src, time + len);
+    src.start(time, offset, len);
+  }
+
+  stopClips(time) {
+    for (const [src, end] of this.clipSources) if (end > time) src.stop(time);
+  }
+
+  startNote(track, midi, time, vel = 0.9) {
+    for (const l of this.tracks[track].layers) l.inst.start(midi, time, vel);
+    this.tracks[track].sub?.start(midi, time, vel);
+  }
+
+  silenceTrack(track, time) {
+    for (const l of this.tracks[track].layers) l.inst.silence(time);
+    this.tracks[track].sub?.silence(time);
+  }
+
+  // ---------- live (knob touched) ----------
+
+  // The track follows the knob right now: { row, x }. Row is the groove (drums), the chord index
+  // (chords), the pitch row (bass, lead) or the pad (voice, which (re)starts its clip on every call).
+  setLive(t, v) {
+    const prev = this.live[t];
+    this.live[t] = v;
+    const now = Tone.immediate();
+    this.setX(t, v.x, now);
+    if (t === 'voice') this.playClip(v.row, now);
+    else if (t === 'chords') {
+      if (prev?.row !== v.row) {
+        const pad = this.tracks.chords.layers[0].inst;
+        pad.silence(now);
+        pad.start(voiceChord(CHORDS[v.row]), now + 0.005, 0.7);
+      }
+    } else if (t !== 'drums') {
+      const midi = this.noteFor(t, v.row, this.heardStep());
+      if (!prev || midi !== this.liveMidi[t]) {
+        this.liveMidi[t] = midi;
+        this.startNote(t, midi, now);
+      }
+    }
+  }
+
+  clearLive(t) {
+    if (!this.live[t]) return;
+    this.live[t] = null;
+    const now = Tone.immediate();
+    if (t === 'voice') this.stopClips(now);
+    else if (t === 'chords') this.retriggerPad();
+    else if (t !== 'drums') {
+      this.silenceTrack(t, now);
+      this.liveMidi[t] = null;
+    }
+  }
+
+  // Plays the song's chord for the rest of the current slot, e.g. after a live chord or an edit.
+  retriggerPad() {
+    if (this.live.chords) return;
+    const pad = this.tracks.chords.layers[0].inst;
+    const now = Tone.immediate();
+    pad.silence(now);
+    this.padDirty = true;
+    if (!this.playing || !this.audible('chords')) return;
+    const pos = this.heardStepFloat() % LOOP;
+    const slot = Math.floor(pos / CHORD_SLOT);
+    const left = ((slot + 1) * CHORD_SLOT - pos) * this.stepSeconds() - 0.03;
+    if (left > 0.08) pad.play(voiceChord(CHORDS[this.song.chords.slots[slot]]), now + 0.005, left, 0.7);
   }
 }
 
 // ---------- export ----------
 
 // Renders the song offline (faster than real time, sample exact) and returns a 16-bit WAV blob.
-export async function renderWav(song, loops = 2, tail = 2.5) {
+export async function renderWav(song, loops = 1, tail = 3) {
   const copy = JSON.parse(JSON.stringify(song));
-  const loopSec = (copy.steps * 60) / copy.bpm / 4;
+  const loopSec = (LOOP * 60) / song.bpm / 4;
   const buf = await Tone.Offline(async ({ transport }) => {
     const e = new Engine(copy);
     await e.ready;

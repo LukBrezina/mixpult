@@ -1,4 +1,4 @@
-// Small DOM helpers and the two custom controls: rotary knob and XY pad.
+// Small DOM helpers and the custom controls: XY effect pad and the snapping knob pad.
 
 export function el(tag, props = {}, ...children) {
   const node = document.createElement(tag);
@@ -25,104 +25,10 @@ export function el(tag, props = {}, ...children) {
 
 const clamp01 = (v) => Math.min(1, Math.max(0, v));
 
-// Rotary knob. Drag up/down, scroll, arrow keys; double click resets.
-// `map` converts between the knob position (0..1) and the real value, for log scales.
-export function knob({ label, value, dflt, min = 0, max = 1, map, format, onInput, bipolar = false, size = 'md', color }) {
-  const toPos = map ? map.toPos : (v) => (v - min) / (max - min);
-  const fromPos = map ? map.fromPos : (p) => min + p * (max - min);
-  let pos = clamp01(toPos(value));
-  const R = 22;
-  const C = 2 * Math.PI * R;
-  const arcLen = C * 0.75;
-  const svgNS = 'http://www.w3.org/2000/svg';
-  const svg = document.createElementNS(svgNS, 'svg');
-  svg.setAttribute('viewBox', '0 0 56 56');
-  svg.innerHTML = `
-    <circle class="knob-track" cx="28" cy="28" r="${R}" stroke-dasharray="${arcLen} ${C}" transform="rotate(135 28 28)"/>
-    <circle class="knob-fill" cx="28" cy="28" r="${R}" transform="rotate(135 28 28)"/>
-    <circle class="knob-cap" cx="28" cy="28" r="15"/>
-    <line class="knob-pointer" x1="28" y1="28" x2="28" y2="16"/>`;
-  const fill = svg.querySelector('.knob-fill');
-  const pointer = svg.querySelector('.knob-pointer');
-  const out = el('span', { class: 'knob-value' });
-  const dial = el('div', { class: 'knob-dial', tabindex: 0, role: 'slider', 'aria-label': label, 'aria-valuemin': 0, 'aria-valuemax': 100 });
-  dial.append(svg);
-  const root = el('div', { class: `knob knob-${size}`, style: color ? { '--knob-color': color } : undefined }, dial, el('label', {}, label), out);
-
-  function paint() {
-    const v = fromPos(pos);
-    if (bipolar) {
-      const centre = arcLen / 2;
-      const len = Math.abs(pos - 0.5) * arcLen;
-      const start = pos >= 0.5 ? centre : centre - len;
-      fill.setAttribute('stroke-dasharray', `0 ${start} ${len} ${C}`);
-      fill.style.opacity = len < 0.5 ? 0 : 1; // round caps would draw a dot for an empty arc
-    } else {
-      fill.setAttribute('stroke-dasharray', `${pos * arcLen} ${C}`);
-      fill.style.opacity = pos * arcLen < 0.5 ? 0 : 1;
-    }
-    pointer.setAttribute('transform', `rotate(${-135 + pos * 270} 28 28)`);
-    out.textContent = format ? format(v) : Math.round(pos * 100);
-    dial.setAttribute('aria-valuenow', Math.round(pos * 100));
-    dial.setAttribute('aria-valuetext', out.textContent);
-  }
-
-  function setPos(p, emit = true) {
-    p = clamp01(p);
-    if (p === pos && emit) return;
-    pos = p;
-    paint();
-    if (emit) onInput?.(fromPos(pos));
-  }
-
-  let drag = null;
-  dial.addEventListener('pointerdown', (e) => {
-    dial.setPointerCapture(e.pointerId);
-    drag = { y: e.clientY, pos };
-    root.classList.add('active');
-    e.preventDefault();
-    dial.focus();
-  });
-  dial.addEventListener('pointermove', (e) => {
-    if (!drag) return;
-    const range = e.shiftKey ? 800 : 180;
-    setPos(drag.pos + (drag.y - e.clientY) / range);
-  });
-  const end = () => {
-    drag = null;
-    root.classList.remove('active');
-  };
-  dial.addEventListener('pointerup', end);
-  dial.addEventListener('pointercancel', end);
-  dial.addEventListener('dblclick', () => setPos(toPos(dflt ?? (bipolar ? fromPos(0.5) : value))));
-  dial.addEventListener('wheel', (e) => {
-    e.preventDefault();
-    setPos(pos - Math.sign(e.deltaY) * 0.03);
-  }, { passive: false });
-  dial.addEventListener('keydown', (e) => {
-    const d = { ArrowUp: 0.02, ArrowRight: 0.02, ArrowDown: -0.02, ArrowLeft: -0.02, PageUp: 0.1, PageDown: -0.1 }[e.key];
-    if (d) {
-      e.preventDefault();
-      e.stopPropagation();
-      setPos(pos + d);
-    }
-  });
-
-  paint();
-  root.set = (v) => setPos(toPos(v), false);
-  return root;
-}
-
-// Exponential knob mapping between lo and hi.
-export const expMap = (lo, hi) => ({
-  toPos: (v) => Math.log(v / lo) / Math.log(hi / lo),
-  fromPos: (p) => lo * Math.pow(hi / lo, p),
-});
-
 // XY pad for performance effects. x, y in 0..1 (y = 1 at the top). Springs back to `home` on release.
-export function xyPad({ labels, home = [0.5, 0], spring = () => true, onMove }) {
+export function xyPad({ labels, home = [0.5, 0], onMove, onRelease }) {
   const puck = el('div', { class: 'xy-puck' });
-  const pad = el('div', { class: 'xy-pad', role: 'application', 'aria-label': 'Efektová plocha' },
+  const pad = el('div', { class: 'xy-pad', role: 'application', 'aria-label': 'Effects pad' },
     el('span', { class: 'xy-label xy-left' }, labels.left),
     el('span', { class: 'xy-label xy-right' }, labels.right),
     el('span', { class: 'xy-label xy-top' }, labels.top),
@@ -157,11 +63,10 @@ export function xyPad({ labels, home = [0.5, 0], spring = () => true, onMove }) 
     if (!down) return;
     down = false;
     pad.classList.remove('active');
-    if (spring()) {
-      cur = [...home];
-      place(cur);
-      onMove(...cur);
-    }
+    cur = [...home];
+    place(cur);
+    onMove(...cur);
+    onRelease?.();
   };
   pad.addEventListener('pointerup', up);
   pad.addEventListener('pointercancel', up);
@@ -170,5 +75,62 @@ export function xyPad({ labels, home = [0.5, 0], spring = () => true, onMove }) 
     cur = [x, y];
     place(cur);
   };
+  return pad;
+}
+
+// Knob pad: a 2D puck. Up/down snaps to `rows` (row 0 at the bottom), left/right is smooth (0..1).
+// Drag anywhere on it; the puck jumps to the finger and stays where it is let go.
+// onTouch(true/false) says when a finger is on it (so the app can play what you are fiddling with).
+export function knobPad({ rows, value = [0.5, 0], rowColor, labels = [], label, onChange, onTouch }) {
+  const INSET = 24;
+  const puck = el('div', { class: 'knob-puck' });
+  const yPos = (r) => `calc(${INSET}px + ${rows > 1 ? r / (rows - 1) : 0.5} * (100% - ${2 * INSET}px))`;
+  const pad = el('div', { class: 'knob-pad', role: 'slider', tabindex: 0, 'aria-label': label },
+    ...Array.from({ length: rows }, (_, r) => el('i', { class: 'knob-row', style: { bottom: yPos(r), '--rc': rowColor(r) } })),
+    el('div', { class: 'knob-labels' }, ...labels.map((txt) => el('span', {}, txt))),
+    puck);
+  let [x, row] = value;
+  function place() {
+    puck.style.left = `calc(${INSET}px + ${x} * (100% - ${2 * INSET}px))`;
+    puck.style.bottom = yPos(row);
+    pad.style.setProperty('--pc', rowColor(row));
+    pad.setAttribute('aria-valuenow', String(row + 1));
+  }
+  function set(nx, nr) {
+    nx = clamp01(nx);
+    nr = Math.max(0, Math.min(rows - 1, nr));
+    if (Math.abs(nx - x) < 0.002 && nr === row) return;
+    [x, row] = [nx, nr];
+    place();
+    onChange(x, row);
+  }
+  function fromEvent(e) {
+    const b = pad.getBoundingClientRect();
+    return [
+      (e.clientX - b.left - INSET) / (b.width - 2 * INSET),
+      Math.round(clamp01(1 - (e.clientY - b.top - INSET) / (b.height - 2 * INSET)) * (rows - 1)),
+    ];
+  }
+  let down = false;
+  pad.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    down = true;
+    try { pad.setPointerCapture(e.pointerId); } catch { /* synthetic pointer */ }
+    pad.classList.add('active');
+    set(...fromEvent(e));
+    onTouch?.(true);
+  });
+  pad.addEventListener('pointermove', (e) => down && set(...fromEvent(e)));
+  const up = () => {
+    if (!down) return;
+    down = false;
+    pad.classList.remove('active');
+    onTouch?.(false);
+  };
+  pad.addEventListener('pointerup', up);
+  pad.addEventListener('pointercancel', up);
+  place();
+  pad.nudge = (dx, dr) => set(x + dx, row + dr);
+  pad.value = () => [x, row];
   return pad;
 }
