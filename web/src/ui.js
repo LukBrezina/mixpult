@@ -47,7 +47,7 @@ export function xyPad({ labels, home = [0.5, 0], onMove, onRelease }) {
   let down = false;
   pad.addEventListener('pointerdown', (e) => {
     down = true;
-    pad.setPointerCapture(e.pointerId);
+    try { pad.setPointerCapture(e.pointerId); } catch { /* synthetic pointer */ }
     pad.classList.add('active');
     cur = fromEvent(e);
     place(cur);

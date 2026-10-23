@@ -1072,6 +1072,20 @@ input[type='range']::-moz-range-thumb {
   line-height: 1.5;
 }
 
+.share-url {
+  width: 100%;
+  margin-top: 4px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  border: 1px solid var(--line2);
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  font-size: 14px;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
 .welcome-actions {
   display: flex;
   gap: 10px;
@@ -1161,7 +1175,10 @@ input[type='range']::-moz-range-thumb {
   margin: -10px 0 0 -27px;
   transform-origin: 50% 10px;
   opacity: 0;
-  animation: 4.4s cubic-bezier(0.45, 0, 0.3, 1) infinite;
+  /* Longhands: a name-less `animation` shorthand gets minified to `animation: none`. */
+  animation-duration: 4.4s;
+  animation-timing-function: cubic-bezier(0.45, 0, 0.3, 1);
+  animation-iteration-count: infinite;
   filter: drop-shadow(0 10px 24px rgb(0 0 0 / 0.5));
 }
 
@@ -1197,7 +1214,9 @@ input[type='range']::-moz-range-thumb {
   border-radius: 50%;
   border: 3px solid #fff;
   opacity: 0;
-  animation: 4.4s ease-out infinite;
+  animation-duration: 4.4s;
+  animation-timing-function: ease-out;
+  animation-iteration-count: infinite;
 }
 
 .thumb.left {

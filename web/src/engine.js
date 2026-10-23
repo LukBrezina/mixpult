@@ -40,6 +40,7 @@ export class Engine {
     this.breakdown = false;
     this.live = perTrack(null); // { row, x } while a knob is touched
     this.liveMidi = perTrack(null);
+    this.lastStart = perTrack(0); // latest note start scheduled on each melodic track's synths
     this.x = perTrack(null); // energy currently applied
     this.clipSources = new Map(); // voice clips playing right now -> their end time
     this.offline = Tone.getContext() instanceof Tone.OfflineContext;
@@ -337,6 +338,7 @@ export class Engine {
     const midi = this.noteFor(track, n.row, step);
     for (const l of this.tracks[track].layers) l.inst.play(midi, time, dur, vel);
     this.tracks[track].sub?.play(midi, time, dur, vel);
+    this.noteStarted(track, time);
   }
 
   // One beat-repeat slice: everything that sounds at `step` starts again, whether its note began
@@ -354,6 +356,7 @@ export class Engine {
       const midi = this.noteFor(t, act.note.row, step);
       for (const l of this.tracks[t].layers) l.inst.play(midi, time, len, 0.9);
       this.tracks[t].sub?.play(midi, time, len, 0.9);
+      this.noteStarted(t, time);
     }
     const v = activeNote(this.song.voice.notes, step);
     if (v && this.audible('voice') && !this.live.voice) {
@@ -399,6 +402,19 @@ export class Engine {
   startNote(track, midi, time, vel = 0.9) {
     for (const l of this.tracks[track].layers) l.inst.start(midi, time, vel);
     this.tracks[track].sub?.start(midi, time, vel);
+    this.noteStarted(track, time);
+  }
+
+  // Tone moves a start that is already in the past (a late tick) to the current time.
+  noteStarted(track, time) {
+    this.lastStart[track] = Math.max(this.lastStart[track], time, Tone.immediate());
+  }
+
+  // A live note starts now, but the sequencer schedules a little ahead of the clock, and a mono
+  // synth refuses a start before one it already has (the note would be lost). So never earlier
+  // than just after the last scheduled start: at most a few milliseconds late.
+  liveTime(track) {
+    return Math.max(Tone.immediate(), this.lastStart[track] + 0.003);
   }
 
   silenceTrack(track, time) {
@@ -426,7 +442,7 @@ export class Engine {
       const midi = this.noteFor(t, v.row, this.heardStep());
       if (!prev || midi !== this.liveMidi[t]) {
         this.liveMidi[t] = midi;
-        this.startNote(t, midi, now);
+        this.startNote(t, midi, this.liveTime(t));
       }
     }
   }

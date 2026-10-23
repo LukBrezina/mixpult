@@ -24,6 +24,9 @@
       <button id="fullscreen" class="icon-btn" title="Full screen" aria-label="Full screen">
         <svg viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" /></svg>
       </button>
+      <button id="share" class="icon-btn" title="Share this song" aria-label="Share this song">
+        <svg viewBox="0 0 24 24"><path d="M12 3v12M8 7l4-4 4 4M6 11H5v10h14V11h-1" /></svg>
+      </button>
       <details class="menu" id="menu">
         <summary class="icon-btn" aria-label="More">
           <svg viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.6" /><circle cx="12" cy="12" r="1.6" /><circle cx="19" cy="12" r="1.6" /></svg>
@@ -31,6 +34,7 @@
         <div class="menu-body">
           <button data-act="undo" id="menu-undo">Undo</button>
           <button data-act="clear" id="menu-clear" class="danger" hidden></button>
+          <button data-act="mine" id="menu-mine" hidden>Back to my song</button>
           <button data-act="new">New song</button>
           <button data-act="tour">Show me around</button>
           <hr />

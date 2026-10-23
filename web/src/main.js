@@ -5,10 +5,11 @@ import { newSong, normalizeSong, apply, TRACKS, ROWS, SLOT, LOOP, isSlotTrack, B
 import { demoSong } from './demo.js';
 import { el, xyPad, knobPad } from './ui.js';
 import { strokeCanvas } from './stroke.js';
-import { Mic, addClip, clips, loadClips, newClipId, trimTake, outline } from './voice.js';
+import { Mic, MAX_CLIP_SEC, addClip, clips, loadClips, newClipId, trimTake, outline } from './voice.js';
 import { Coach } from './tour.js';
 
 const STORAGE_KEY = 'mixpult.song.v3';
+const MINE_KEY = 'mixpult.song.mine'; // your own song, kept aside while you remix a shared one
 const PAD_KEYS = ['KeyA', 'KeyS', 'KeyD', 'KeyF'];
 const HOLD_KEY = 'KeyF';
 const keyLabels = Object.fromEntries(PAD_KEYS.map((c) => [c, c.slice(3)]));
@@ -133,8 +134,10 @@ function toast(msg, ms = 1800) {
 
 function initHeader() {
   $('play').addEventListener('click', togglePlay);
+  $('share').addEventListener('click', shareSong);
   $('menu').addEventListener('toggle', () => {
     $('menu-undo').disabled = !undoStack.length;
+    $('menu-mine').hidden = !readMine();
     // ponytail: screen numbers for sorting out iPhone layout gaps from a screenshot; drop once settled.
     const safe = getComputedStyle($('tabs')).paddingBottom;
     $('screen-info').textContent = `view ${Math.round(window.innerHeight)} · app ${Math.round(document.body.getBoundingClientRect().height)} · screen ${screen.height} · pad ${safe}${homeScreen ? ' · home' : ''}`;
@@ -212,6 +215,13 @@ async function menuAction(act) {
     setSong(freshSong());
     await loadPresetClips();
     toast('Blank slate');
+  } else if (act === 'mine') {
+    const mine = readMine();
+    if (!mine) return;
+    undoStack.push(JSON.stringify(song));
+    setSong(mine);
+    try { localStorage.removeItem(MINE_KEY); } catch { /* ignore */ }
+    toast('Back to your song');
   } else if (act === 'tour') {
     startTour();
   } else if (act === 'undo') {
@@ -937,7 +947,7 @@ function tourUpdate() {
   }
   const panel = $('panel');
   if (tour.did) {
-    if (tab !== tour.did) return endTour('That’s it, the rest works the same. Have fun!');
+    if (tab !== tour.did) return endTour('You got it. Now explore the other tabs and jam around!');
     const i = (TABS.findIndex((x) => x.id === tab) + 1) % TABS.length;
     const next = TABS[i];
     const btn = $('tabs').children[i];
@@ -980,6 +990,157 @@ async function loadPresetClips() {
   }));
 }
 
+// ---------- sharing ----------
+
+// A shared song is a frozen copy on the server (see worker.js) with its own voice clips. Whoever
+// opens the link gets their own copy to remix; the link always plays the original.
+const SHARE_ID = /^[a-z0-9]{10}$/;
+
+function readMine() {
+  try {
+    const raw = localStorage.getItem(MINE_KEY);
+    return raw ? normalizeSong(JSON.parse(raw)) : null;
+  } catch {
+    return null;
+  }
+}
+
+// Clips travel as 16-bit PCM in base64: half the size of floats, no audible difference.
+function encodeClip(buf) {
+  const f = buf.getChannelData(0);
+  const pcm = new Int16Array(f.length);
+  for (let i = 0; i < f.length; i++) pcm[i] = Math.max(-1, Math.min(1, f[i])) * 32767;
+  const bytes = new Uint8Array(pcm.buffer);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return { rate: buf.sampleRate, pcm: btoa(bin) };
+}
+
+function decodeClip(c) {
+  if (typeof c?.pcm !== 'string' || !(c.rate >= 8000 && c.rate <= 96000)) return null;
+  const bin = atob(c.pcm);
+  const pcm = new Int16Array(Math.min(bin.length >> 1, Math.ceil(c.rate * MAX_CLIP_SEC)));
+  const bytes = new Uint8Array(pcm.buffer);
+  for (let i = 0; i < bytes.length; i++) bytes[i] = bin.charCodeAt(i);
+  return Float32Array.from(pcm, (v) => v / 32767);
+}
+
+async function shareSong() {
+  const btn = $('share');
+  if (btn.disabled) return;
+  btn.disabled = true;
+  toast('Making a link…', 15000);
+  try {
+    const own = {};
+    for (const id of song.voice.pads) {
+      if (id && !(id in PRESET_CLIPS) && clips.has(id)) own[id] = encodeClip(clips.get(id));
+    }
+    const res = await fetch('/api/songs', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ song, clips: own }),
+    });
+    if (!res.ok) throw new Error(`share failed: ${res.status}`);
+    const { id } = await res.json();
+    $('toast').classList.remove('show');
+    shareDialog(`${location.origin}${location.pathname}?s=${id}`);
+  } catch (err) {
+    console.warn(err);
+    toast('Could not make a link. Are you online?', 3000);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// The link is ready: share it from a fresh tap (iPhone refuses to open the share sheet after
+// waiting for the upload), or copy it.
+function shareDialog(url) {
+  const close = () => {
+    dlg.close();
+    dlg.remove();
+  };
+  const dlg = el('dialog', { class: 'welcome' },
+    el('h2', {}, 'Your song has a link'),
+    el('p', {}, 'Whoever opens it hears your track and can remix their own copy. This link always plays it the way it is now.'),
+    el('input', { class: 'share-url', value: url, readonly: true, onfocus: (e) => e.target.select() }),
+    el('div', { class: 'welcome-actions' },
+      el('button', {
+        class: 'btn-secondary',
+        onclick: async () => {
+          try {
+            await navigator.clipboard.writeText(url);
+            toast('Link copied');
+          } catch {
+            toast('Copy it from the box above');
+            return;
+          }
+          close();
+        },
+      }, 'Copy'),
+      navigator.share
+        ? el('button', {
+          class: 'btn-primary',
+          onclick: async () => {
+            try {
+              await navigator.share({ title: 'Mixpult', text: 'I made a track, remix it:', url });
+              close();
+            } catch { /* cancelled */ }
+          },
+        }, 'Share…')
+        : el('button', { class: 'btn-primary', onclick: close }, 'Done')));
+  dlg.addEventListener('click', (e) => e.target === dlg && close());
+  document.body.append(dlg);
+  dlg.showModal();
+  document.activeElement?.blur();
+}
+
+// Opening a shared link: your own song is kept aside (Back to my song in the menu), the shared one
+// plays, and the tour shows how to change it.
+async function openShared(id) {
+  history.replaceState(null, '', location.pathname); // a reload keeps your remix
+  let data;
+  let remix;
+  try {
+    const res = await fetch(`/api/songs/${id}`);
+    if (!res.ok) throw new Error(`not found: ${res.status}`);
+    data = await res.json();
+    if (data?.song?.v !== 3) throw new Error('not a song');
+    remix = normalizeSong(data.song);
+  } catch (err) {
+    console.warn(err);
+    toast('That shared song could not be opened.', 4000);
+    return;
+  }
+  for (const [cid, c] of Object.entries(data.clips ?? {})) {
+    if (!remix.voice.pads.includes(cid)) continue;
+    const pcm = decodeClip(c);
+    if (pcm) addClip(cid, pcm, c.rate);
+  }
+  if (stored && !readMine() && JSON.stringify(stored) !== JSON.stringify(remix)) {
+    try { localStorage.setItem(MINE_KEY, JSON.stringify(stored)); } catch { /* storage full */ }
+  }
+  setSong(remix);
+  await loadPresetClips();
+  renderPanel();
+
+  const dlg = el('dialog', { class: 'welcome' },
+    el('h2', {}, el('span', { class: 'logo' }, 'mixpult')),
+    el('p', {}, 'Someone made this track and shared it with you. Hear it, then make it yours: your changes stay on your phone, the original stays as it is.'),
+    el('div', { class: 'welcome-actions' },
+      el('button', {
+        class: 'btn-primary',
+        onclick: async () => {
+          dlg.close();
+          dlg.remove();
+          await startLoop();
+          startTour();
+        },
+      }, '▶ Play it')));
+  document.body.append(dlg);
+  dlg.showModal();
+  document.activeElement?.blur();
+}
+
 // ---------- boot ----------
 
 Tone.getContext().lookAhead = 0.05;
@@ -996,10 +1157,14 @@ window.visualViewport?.addEventListener('resize', fitScreen);
 window.addEventListener('orientationchange', () => setTimeout(fitScreen, 300));
 initHeader();
 renderAll();
-loadClips(new Set(song.voice.pads.filter(Boolean)))
+// Keep the clips of the current song and of your own song set aside while remixing.
+loadClips(new Set([...song.voice.pads, ...(readMine()?.voice.pads ?? [])].filter(Boolean)))
   .then(loadPresetClips)
   .then(() => tab === 'voice' && renderPanel());
-if (!stored) {
+const sharedId = new URLSearchParams(location.search).get('s');
+if (sharedId && SHARE_ID.test(sharedId)) {
+  openShared(sharedId);
+} else if (!stored) {
   // Touch screens outside an installed app first learn how to go full screen; desktops skip it.
   const guide = !homeScreen && matchMedia('(pointer: coarse)').matches;
   (guide ? fullscreenGuide() : Promise.resolve()).then(startTour);
