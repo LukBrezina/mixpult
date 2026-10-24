@@ -1,7 +1,7 @@
 import './style.css';
 import * as Tone from 'tone';
 import { Engine, renderWav } from './engine.js';
-import { newSong, normalizeSong, apply, TRACKS, ROWS, SLOT, LOOP, isSlotTrack, BPM_RANGE } from './song.js';
+import { newSong, normalizeSong, apply, activeNote, TRACKS, ROWS, SLOT, LOOP, isSlotTrack, BPM_RANGE } from './song.js';
 import { demoSong } from './demo.js';
 import { el, xyPad, knobPad } from './ui.js';
 import { strokeCanvas } from './stroke.js';
@@ -138,9 +138,6 @@ function initHeader() {
   $('menu').addEventListener('toggle', () => {
     $('menu-undo').disabled = !undoStack.length;
     $('menu-mine').hidden = !readMine();
-    // ponytail: screen numbers for sorting out iPhone layout gaps from a screenshot; drop once settled.
-    const safe = getComputedStyle($('tabs')).paddingBottom;
-    $('screen-info').textContent = `view ${Math.round(window.innerHeight)} · app ${Math.round(document.body.getBoundingClientRect().height)} · screen ${screen.height} · pad ${safe}${homeScreen ? ' · home' : ''}`;
   });
   initFullscreen();
 
@@ -378,13 +375,44 @@ const trackHex = (t) => getComputedStyle(document.documentElement).getPropertyVa
 const loopPos = () => (engine.playing ? engine.heardStepFloat() % LOOP : null);
 
 // Writes a held note [a, b) (loop steps counting up from the start) into the loop, split at its end.
-function commitNote(t, row, a, b) {
+// `mine` (a punch-in's) collects where the new notes start, so the punch never erases them.
+function commitNote(t, row, a, b, mine = null) {
   const s = Math.round(a);
   const len = Math.min(LOOP, Math.max(1, Math.round(b) - s));
   const start = mod(s, LOOP);
   const first = Math.min(len, LOOP - start);
   dispatch({ k: 'note', t, s: start, note: { row, len: first } }, { tag: `rec-${t}` });
-  if (len > first) dispatch({ k: 'note', t, s: 0, note: { row, len: len - first } }, { tag: `rec-${t}` });
+  mine?.add(start);
+  if (len > first) {
+    dispatch({ k: 'note', t, s: 0, note: { row, len: len - first } }, { tag: `rec-${t}` });
+    mine?.add(0);
+  }
+}
+
+// Recording over a note track replaces it, like punching in on tape: while record is held the
+// old notes are silent and erased as the loop passes them, so holding record and playing nothing
+// leaves silence. A note that was already sounding is cut where the hold began.
+function punchIn(t) {
+  const p = { t, mine: new Set() };
+  engine.setPunch(t, true);
+  if (engine.playing) {
+    const heard = Math.floor(engine.heardStepFloat());
+    const h = heard % LOOP;
+    const act = activeNote(song[t].notes, h);
+    if (act && act.start < h) dispatch({ k: 'note', t, s: act.start, note: { ...act.note, len: h - act.start } }, { tag: `rec-${t}` });
+    else if (act) dispatch({ k: 'note', t, s: h, note: null }, { tag: `rec-${t}` });
+    // Steps the sequencer has already scheduled, a little ahead of what you hear, may be past onStep.
+    for (let s = heard + 1; s < engine.counter && s - heard <= 4; s++) punchStep(p, s % LOOP);
+  }
+  return p;
+}
+
+function punchStep(p, step) {
+  if (song[p.t].notes[step] && !p.mine.has(step)) dispatch({ k: 'note', t: p.t, s: step, note: null }, { tag: `rec-${p.t}` });
+}
+
+function punchOut(p) {
+  if (p) engine.setPunch(p.t, false);
 }
 
 // What the line shows: runs of equal slots (drums, chords) or notes as they are played (bass, lead),
@@ -417,9 +445,9 @@ function trackPanel(t) {
   const colorOf = t === 'chords' ? (row) => CHORD_COLORS[CHORD_ORDER[row]] : () => trackHex(t);
   const live = () => ({ row: toValue(knobAt[t][1]), x: knobAt[t][0] });
   let touching = false;
-  // { from, row, gated } while recording; from = null while no note is being written.
-  // gated: the knob was touched during this hold, so from then on notes sound and record only
-  // while the knob is touched, exactly like playing it without recording (sharp, chopped notes).
+  // { from, row, gated, wrote, punch } while recording; from = null while no note is being written.
+  // gated (bass, melody): notes sound and record only while the knob is touched, exactly like
+  // playing it without recording (sharp, chopped notes); record alone writes silence.
   let rec = null;
 
   const writeSlot = (pos) => {
@@ -439,11 +467,17 @@ function trackPanel(t) {
       knobAt[t] = [x, row];
       if (!touching && !rec) return;
       engine.setLive(t, live());
-      if (!moved || rec?.from == null || !engine.playing) return;
-      // Recording and the row changed: the line steps to the new height.
+      if (!rec || !engine.playing) return;
       const now = engine.heardStepFloat();
+      if (rec.from == null) {
+        // Arrow keys while recording (no finger on the knob): the first press starts a note.
+        if (!touching && !slotTrack) Object.assign(rec, { from: now, row, wrote: true });
+        return;
+      }
+      if (!moved) return;
+      // Recording and the row changed: the line steps to the new height.
       if (slotTrack) writeSlot(now);
-      else commitNote(t, rec.row, rec.from, now);
+      else commitNote(t, rec.row, rec.from, now, rec.punch?.mine);
       rec = { ...rec, from: now, row };
     },
     onTouch: async (on) => {
@@ -460,7 +494,7 @@ function trackPanel(t) {
         engine.setLive(t, live());
         await startLoop();
       } else if (gate && rec.gated) {
-        if (rec.from != null && engine.playing) commitNote(t, rec.row, rec.from, engine.heardStepFloat());
+        if (rec.from != null && engine.playing) commitNote(t, rec.row, rec.from, engine.heardStepFloat(), rec.punch?.mine);
         rec.from = null;
         engine.clearLive(t);
       } else if (!rec) engine.clearLive(t);
@@ -473,23 +507,24 @@ function trackPanel(t) {
     sub: 'to record',
     cls: `hold ${t}`,
     down: () => {
-      rec = { from: null, row: knobAt[t][1], gated: touching && !slotTrack, wrote: false };
-      engine.setLive(t, live());
+      rec = { from: null, row: knobAt[t][1], gated: !slotTrack, wrote: false, punch: slotTrack ? null : punchIn(t) };
+      if (slotTrack || touching) engine.setLive(t, live());
       const begin = () => {
         if (rec.gated && !touching) return;
         rec.from = engine.heardStepFloat();
         rec.wrote = true;
         if (slotTrack) writeSlot(rec.from);
       };
-      // Right away when the loop runs, so short chopped taps on the button all become notes.
+      // Right away when the loop runs: a finger already on the knob starts its note at once.
       if (engine.playing) begin();
       else {
         const mine = rec;
         startLoop().then(() => rec === mine && begin());
       }
       return () => {
-        if (rec?.from != null && engine.playing && !slotTrack) commitNote(t, rec.row, rec.from, engine.heardStepFloat());
+        if (rec?.from != null && engine.playing && !slotTrack) commitNote(t, rec.row, rec.from, engine.heardStepFloat(), rec.punch?.mine);
         const wrote = rec?.wrote;
+        punchOut(rec?.punch);
         rec = null;
         if (!touching) engine.clearLive(t);
         if (wrote) tourDid(t);
@@ -497,9 +532,12 @@ function trackPanel(t) {
     },
   });
 
-  // While recording, every step takes the knob's energy, and drums/chords take its row per slot.
+  // While recording, old notes give way, every step takes the knob's energy, and drums/chords
+  // take its row per slot.
   view.onStep = (step) => {
-    if (step < 0 || rec?.from == null) return;
+    if (step < 0 || !rec) return;
+    if (rec.punch) punchStep(rec.punch, step);
+    if (rec.from == null) return;
     dispatch({ k: 'x', t, s: step, v: [knobAt[t][0]] }, { tag: `rec-${t}` });
     if (slotTrack && step % SLOT[t] === 0) writeSlot(step);
   };
@@ -553,9 +591,10 @@ function voicePanel() {
   let recording = false; // the hold button is down
   let held = null; // { row, from } a pad press being written into the loop
   let wrote = false; // this hold of the record button put a clip into the loop
+  let punch = null; // while record is held: the old clips give way
 
   const commitHeld = () => {
-    if (held && engine.playing) commitNote(t, held.row, held.from, engine.heardStepFloat());
+    if (held && engine.playing) commitNote(t, held.row, held.from, engine.heardStepFloat(), punch?.mine);
     held = null;
   };
   const startHeld = (row) => {
@@ -683,14 +722,22 @@ function voicePanel() {
     down: () => {
       recording = true;
       wrote = false;
+      punch = punchIn(t);
       startLoop().then(() => recording && active !== null && startHeld(active));
       return () => {
         commitHeld();
         recording = false;
+        punchOut(punch);
+        punch = null;
         if (wrote) tourDid(t);
       };
     },
   });
+
+  // While record is held, the old clips give way as the loop passes them.
+  view.onStep = (step) => {
+    if (step >= 0 && punch) punchStep(punch, step);
+  };
 
   const canvas = strokeCanvas({
     rows: ROWS[t],
@@ -716,7 +763,7 @@ function voicePanel() {
 
 function fxPanel() {
   const xy = xyPad({
-    labels: { left: '◀ muffle', right: 'thin ▶', top: '▲ squelch', bottom: '' },
+    labels: { left: '◀ muffle', right: 'thin ▶', top: '▲ space', bottom: '' },
     home: [0.5, 0],
     onMove: (x, y) => engine.setXY((x - 0.5) * 2, y),
     onRelease: () => tourDid('fx'),
@@ -773,7 +820,10 @@ function fxPanel() {
 
 function renderPanel() {
   padHandlers.clear();
-  for (const t of TRACKS) engine.clearLive(t);
+  for (const t of TRACKS) {
+    engine.clearLive(t);
+    engine.setPunch(t, false);
+  }
   mic.stop();
   view = {};
   renderHeader();

@@ -28,6 +28,9 @@ const MELODIC = ['bass', 'lead'];
 const LAYERED = ['chords', ...MELODIC];
 const perTrack = (v) => Object.fromEntries(TRACKS.map((t) => [t, v]));
 const CHORD_SLOT = SLOT.chords;
+// XY "space": the send into the hall at the top of the pad, and how far the dry mix steps back there.
+const WASH_SEND = 0.9;
+const WASH_DUCK = 0.3;
 
 export class Engine {
   constructor(song) {
@@ -39,6 +42,7 @@ export class Engine {
     this.stutter = null;
     this.breakdown = false;
     this.live = perTrack(null); // { row, x } while a knob is touched
+    this.punch = perTrack(false); // recording over the track: its old notes stay silent
     this.liveMidi = perTrack(null);
     this.lastStart = perTrack(0); // latest note start scheduled on each melodic track's synths
     this.x = perTrack(null); // energy currently applied
@@ -59,7 +63,13 @@ export class Engine {
       return a < 0.7 ? x : Math.sign(x) * (0.7 + 0.29 * Math.tanh((a - 0.7) / 0.29));
     }, 4096);
     this.out = new Tone.Volume(-1);
-    this.master.chain(this.djHP, this.djLP, this.comp, this.limiter, this.clip, this.out, Tone.getDestination());
+    this.dry = new Tone.Gain(1);
+    this.master.chain(this.dry, this.djHP, this.djLP, this.comp, this.limiter, this.clip, this.out, Tone.getDestination());
+    // Space (XY pad up): the whole mix is thrown into a big hall that rings on after letting go.
+    // It returns before the DJ filters, so muffled or thin plus space sweeps the tail too.
+    this.washSend = new Tone.Gain(0);
+    this.wash = new Tone.Reverb({ decay: 6.5, preDelay: 0.02, wet: 1 });
+    this.master.chain(this.washSend, new Tone.Filter({ type: 'highpass', frequency: 280 }), this.wash, this.djHP);
 
     // Everything except drums goes through this bus, which ducks on every kick (sidechain pump).
     this.music = new Tone.Gain(1).connect(this.master);
@@ -103,7 +113,7 @@ export class Engine {
   }
 
   get ready() {
-    return Promise.all([this.drums.ready, this.reverb.ready]);
+    return Promise.all([this.drums.ready, this.reverb.ready, this.wash.ready]);
   }
 
   // ---------- song / mixer ----------
@@ -144,23 +154,33 @@ export class Engine {
     xfade(x).forEach((g, i) => this.tracks[t].layers[i].gain.gain.setTargetAtTime(g, time, 0.025));
   }
 
-  // XY pad. x: -1 = lowpass down, 0 = off, +1 = highpass up. y: 0..1 resonance.
+  // XY pad. x: -1 = lowpass down, 0 = off, +1 = highpass up. y: 0..1 space (plus a little
+  // resonance, so a sweep up there sings), with the dry mix stepping back as the hall grows.
   setXY(x, y) {
     const lp = x < 0 ? 20000 * Math.pow(160 / 20000, -x) : 20000;
     const hp = x > 0 ? 20 * Math.pow(6000 / 20, x) : 10;
-    const q = 0.8 + y * 9;
+    const q = 0.8 + y * 3;
     this.djLP.frequency.rampTo(lp, 0.04);
     this.djHP.frequency.rampTo(hp, 0.04);
     this.djLP.Q.rampTo(q, 0.04);
     this.djHP.Q.rampTo(q, 0.04);
+    this.washSend.gain.rampTo(WASH_SEND * Math.sqrt(y), 0.06);
+    this.dry.gain.rampTo(1 - WASH_DUCK * y, 0.06);
   }
 
-  // Beat repeat: while held, the first `len` steps of the current beat play over and over.
+  // Beat repeat, like a DJ loop roll: while held, the first `len` steps of the current beat play
+  // over and over, locked to the grid. The song runs on underneath, and letting go waits for the
+  // next beat, so the way back always lands on a kick, right where the song has got to.
   setStutter(len) {
-    const was = this.stutter;
-    this.stutter = len ? { len, anchor: null, n: 0 } : null;
-    if (len && !was) this.tracks.chords.layers[0].inst.silence(Tone.immediate()); // the long pad gives way to the repeats
-    if (was && !len) this.retriggerPad(); // the pad comes back right away, not at the next slot
+    const st = this.stutter;
+    if (len && st) Object.assign(st, { len, release: false });
+    else if (len) {
+      this.stutter = { len, anchor: null, release: false };
+      this.tracks.chords.layers[0].inst.silence(Tone.immediate()); // the long pad gives way to the repeats
+    } else if (st) {
+      if (this.playing) st.release = true;
+      else this.stutter = null;
+    }
   }
 
   setBreakdown(on) {
@@ -236,24 +256,32 @@ export class Engine {
   tick(time) {
     let step = this.counter % LOOP;
     this.counter++;
-    const st = this.stutter;
+    let st = this.stutter;
+    const resume = st?.release && step % 4 === 0;
+    if (resume) this.stutter = st = null;
     let sliceStart = false;
+    let sliceLen = 0;
     if (st) {
-      // From the start of the beat, where the kick is, so the repeat always has a punch.
-      if (st.anchor === null) st.anchor = step - (step % 4);
-      sliceStart = st.n % st.len === 0;
-      step = st.anchor + (st.n++ % st.len);
+      // From the start of the beat, where the kick is, so the repeat always has a punch. The first
+      // slice may start off the grid (a press between the 16ths), the rest are on it.
+      const first = st.anchor === null;
+      if (first) st.anchor = step - (step % 4);
+      const k = step % st.len;
+      sliceStart = first || k === 0;
+      sliceLen = st.len - k;
+      step = st.anchor + k;
     }
 
     for (const t of TRACKS) this.setX(t, this.live[t]?.x ?? this.song[t].x[step], time);
     if (!this.breakdown) this.tickDrums(step, time);
     if (st) {
-      if (sliceStart) this.tickRepeat(step, time, st.len * this.stepSeconds());
+      if (sliceStart) this.tickRepeat(step, time, sliceLen * this.stepSeconds());
     } else {
+      if (resume) this.resumePad(step, time);
       this.tickChords(step, time);
-      if (!this.breakdown) this.tickMelodic('bass', step, time);
-      this.tickMelodic('lead', step, time);
-      this.tickVoice(step, time);
+      if (!this.breakdown) this.tickMelodic('bass', step, time, resume);
+      this.tickMelodic('lead', step, time, resume);
+      this.tickVoice(step, time, resume);
     }
 
     // A live note held across a chord change follows the new chord.
@@ -315,13 +343,14 @@ export class Engine {
     }
   }
 
-  tickMelodic(track, step, time) {
-    if (!this.audible(track) || this.live[track]) return;
+  // `resume`: back from a beat repeat, so a note that began earlier comes back for the rest of it.
+  tickMelodic(track, step, time, resume = false) {
+    if (!this.audible(track) || this.live[track] || this.punch[track]) return;
     const notes = this.song[track].notes;
     let start = step;
     let n = notes[step];
     // A long note crossing into a new chord is re-pitched to it, so it never clashes.
-    if (!n && step % CHORD_SLOT === 0) {
+    if (!n && (resume || step % CHORD_SLOT === 0)) {
       const act = activeNote(notes, step);
       if (act) {
         start = act.start;
@@ -350,7 +379,7 @@ export class Engine {
       for (const l of this.tracks.chords.layers) l.inst.play(notes, time, len, 0.7);
     }
     for (const t of MELODIC) {
-      if (!this.audible(t) || this.live[t] || (t === 'bass' && this.breakdown)) continue;
+      if (!this.audible(t) || this.live[t] || this.punch[t] || (t === 'bass' && this.breakdown)) continue;
       const act = activeNote(this.song[t].notes, step);
       if (!act) continue;
       const midi = this.noteFor(t, act.note.row, step);
@@ -359,20 +388,22 @@ export class Engine {
       this.noteStarted(t, time);
     }
     const v = activeNote(this.song.voice.notes, step);
-    if (v && this.audible('voice') && !this.live.voice) {
+    if (v && this.audible('voice') && !this.live.voice && !this.punch.voice) {
       this.playClip(v.note.row, time, dur, (step - v.start) * this.stepSeconds());
     }
     this.padDirty = true;
   }
 
   // Voice pads in the loop: a note plays its pad's clip for as long as the pad was held.
-  tickVoice(step, time) {
+  tickVoice(step, time, resume = false) {
+    if (!this.audible('voice') || this.live.voice || this.punch.voice) return;
     const notes = this.song.voice.notes;
-    const n = notes[step];
-    if (!n || !this.audible('voice') || this.live.voice) return;
+    const act = notes[step] ? { start: step, note: notes[step] } : resume && activeNote(notes, step);
+    if (!act) return;
     let dist = 1;
     while (step + dist < LOOP && !notes[step + dist]) dist++;
-    this.playClip(n.row, time, Math.min(n.len, dist) * this.stepSeconds());
+    const sd = this.stepSeconds();
+    this.playClip(act.note.row, time, Math.min(act.start + act.note.len - step, dist) * sd, (step - act.start) * sd);
   }
 
   // One clip at a time, like chopping on a launchpad: a new one cuts the last.
@@ -424,6 +455,17 @@ export class Engine {
 
   // ---------- live (knob touched) ----------
 
+  // Recording replaces what a track had: while record is held its old notes stay silent, so you
+  // only hear what you play (main.js erases them as the loop passes).
+  setPunch(t, on) {
+    if (this.punch[t] === on) return;
+    this.punch[t] = on;
+    if (!on || this.live[t]) return;
+    // Also cuts a note the sequencer has already scheduled a moment ahead.
+    if (t === 'voice') this.stopClips(Tone.immediate());
+    else this.silenceTrack(t, this.liveTime(t));
+  }
+
   // The track follows the knob right now: { row, x }. Row is the groove (drums), the chord index
   // (chords), the pitch row (bass, lead) or the pad (voice, which (re)starts its clip on every call).
   setLive(t, v) {
@@ -457,6 +499,13 @@ export class Engine {
       this.silenceTrack(t, now);
       this.liveMidi[t] = null;
     }
+  }
+
+  // Back from a beat repeat in the middle of a chord slot: the pad plays the rest of it.
+  resumePad(step, time) {
+    if (this.live.chords || !this.audible('chords') || step % CHORD_SLOT === 0) return;
+    const left = (CHORD_SLOT - (step % CHORD_SLOT)) * this.stepSeconds() - 0.03;
+    this.tracks.chords.layers[0].inst.play(voiceChord(this.chordAt(step)), time, left, 0.7);
   }
 
   // Plays the song's chord for the rest of the current slot, e.g. after a live chord or an edit.
