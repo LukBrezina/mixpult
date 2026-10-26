@@ -265,6 +265,12 @@ kbd {
   color: var(--text);
 }
 
+.menu-info {
+  padding: 4px 12px 2px;
+  font-size: 10px;
+  color: var(--dim);
+}
+
 /* ---------- the loop at a glance ---------- */
 
 .song {
@@ -301,6 +307,8 @@ kbd {
   position: absolute;
   top: 0;
   bottom: 0;
+  left: 0;
+  will-change: transform;
   width: 3px;
   margin-left: -1.5px;
   background: #fff;
@@ -708,14 +716,16 @@ canvas.stroke {
 
 .knob-puck {
   position: absolute;
+  left: 0;
+  bottom: 0;
   width: 34px;
   height: 34px;
-  transform: translate(-50%, 50%);
+  will-change: transform;
   border-radius: 50%;
   background: radial-gradient(circle at 35% 35%, #fff 0 18%, var(--pc) 45%);
   box-shadow: 0 0 0 7px color-mix(in srgb, var(--pc) 20%, transparent), 0 0 28px color-mix(in srgb, var(--pc) 75%, transparent);
   pointer-events: none;
-  transition: bottom 0.08s ease-out;
+  transition: transform 0.08s ease-out;
 }
 
 .knob-pad.active .knob-puck {
@@ -748,6 +758,9 @@ canvas.stroke {
   height: 9px;
   border-radius: 50%;
   background: var(--rec);
+  /* Its own layer: the blink while recording otherwise repainted the whole page, too much for
+     a phone's GPU next to the audio. */
+  will-change: opacity;
 }
 
 .pad.hold.pressed .pad-sub {
@@ -772,11 +785,19 @@ canvas.stroke {
 
 /* ---------- fx ---------- */
 
-/* Nearly the whole panel, but the Hold heading and the pad tops peek out below,
-   so the page visibly goes on. */
-.xy-block {
+/* The XY pad and the hold pads always fit the panel together, so you can sweep and stutter at
+   once. Tempo and levels sit below; their heading peeks out, so the page visibly goes on. */
+.fx-stage {
   flex: none;
-  height: max(200px, calc(100% - 76px));
+  height: max(300px, calc(100% - 40px));
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.xy-block {
+  flex: 1;
+  min-height: 150px;
 }
 
 .xy-pad {

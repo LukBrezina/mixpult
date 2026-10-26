@@ -45,6 +45,30 @@ export default {
     }
 
     if (pathname.startsWith('/api/')) return json({ error: 'not found' }, 404);
+    if (pathname === '/') return page(req, env);
     return env.ASSETS.fetch(req);
   },
 };
+
+// A shared song's link gets its own preview card and text in WhatsApp, Facebook and co.
+const SHARED = {
+  'og:title': 'I made a track on Mixpult. Come remix it.',
+  'og:description': 'Tap to hear it, then make it your own: catchy night techno from your phone.',
+  'og:image:alt': 'Mixpult: a glowing loop line under the words I made a track. Come remix it.',
+};
+
+async function page(req, env) {
+  const res = await env.ASSETS.fetch(req);
+  const url = new URL(req.url);
+  const id = url.searchParams.get('s');
+  if (!id || !ID.test(id) || !res.headers.get('content-type')?.includes('text/html')) return res;
+  const tags = { ...SHARED, 'og:url': `${url.origin}/?s=${id}`, 'og:image': `${url.origin}/og-song.jpg` };
+  return new HTMLRewriter()
+    .on('meta[property]', {
+      element(el) {
+        const v = tags[el.getAttribute('property')];
+        if (v) el.setAttribute('content', v);
+      },
+    })
+    .transform(res);
+}

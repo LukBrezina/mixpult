@@ -9,7 +9,11 @@ const https = existsSync('.cert/key.pem')
   ? { key: readFileSync('.cert/key.pem'), cert: readFileSync('.cert/cert.pem') }
   : undefined;
 
+// Shown at the bottom of the menu, so a phone shows at a glance which deploy it is running.
+const build = new Date().toLocaleString('en-GB', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Prague' });
+
 export default defineConfig({
+  define: { __BUILD__: JSON.stringify(build) },
   server: { host: true, port: 5317, https },
   preview: { host: true, port: 5317, https },
 });

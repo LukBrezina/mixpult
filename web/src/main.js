@@ -8,6 +8,15 @@ import { strokeCanvas } from './stroke.js';
 import { Mic, MAX_CLIP_SEC, addClip, clips, loadClips, newClipId, trimTake, outline } from './voice.js';
 import { Coach } from './tour.js';
 
+// Tone on the browser's own AudioContext. Its default wrapper (standardized-audio-context) checks
+// every new connection for feedback loops by walking every path from it to the speakers, and each
+// note connects fresh oscillators: in this mix that cost tens of milliseconds per chord on a phone,
+// so the loop stuttered on Android. Offline renders keep Tone's own context.
+// 'balanced' (about 20 ms on Android instead of 4): with the smallest buffer a mid-range phone
+// broke up whenever the screen got busy. Recording still lines up, as the engine adds the
+// context's reported latency.
+Tone.setContext(new Tone.Context(new AudioContext({ latencyHint: 'balanced' })));
+
 const STORAGE_KEY = 'mixpult.song.v3';
 const MINE_KEY = 'mixpult.song.mine'; // your own song, kept aside while you remix a shared one
 const PAD_KEYS = ['KeyA', 'KeyS', 'KeyD', 'KeyF'];
@@ -100,7 +109,6 @@ function dispatch(op, { tag = null } = {}) {
   save();
   if (op.k === 'slot' && op.t === 'chords') renderSong();
   if (op.k === 'note' || op.k === 'clear') renderTabs();
-  if (op.k === 'mute') renderPanel();
   return true;
 }
 
@@ -133,6 +141,7 @@ function toast(msg, ms = 1800) {
 // ---------- header ----------
 
 function initHeader() {
+  $('build').textContent = `Version ${__BUILD__}`;
   $('play').addEventListener('click', togglePlay);
   $('share').addEventListener('click', shareSong);
   $('menu').addEventListener('toggle', () => {
@@ -277,6 +286,16 @@ async function unlockAudio() {
   await Tone.start();
 }
 
+// Chrome on Android lets audio start only on the end of a touch (or a click or key), not on the
+// pointerdown that pads and knobs react to, so a first touch there may leave it asleep. Any such
+// gesture wakes it, which also brings it back after a call or a locked screen. Only resumes: the
+// audio session type is left alone, a voice take may have set it.
+for (const type of ['pointerup', 'touchend', 'click', 'keydown']) {
+  window.addEventListener(type, () => {
+    if (Tone.getContext().state !== 'running') Tone.start().catch(() => {});
+  }, { capture: true, passive: true });
+}
+
 engine.onStep = (step) => {
   playStep = step;
   songPlayhead(step);
@@ -296,7 +315,8 @@ function songPlayhead(step) {
   const head = $('song').querySelector('.timeline-head');
   if (!head) return;
   head.style.display = step < 0 ? 'none' : 'block';
-  head.style.left = `${((step + 0.5) / LOOP) * 100}%`;
+  // By transform, so the page is not repainted on every step.
+  head.style.transform = `translateX(${((step + 0.5) / LOOP) * head.parentElement.clientWidth}px)`;
 }
 
 // ---------- tabs ----------
@@ -782,14 +802,25 @@ function fxPanel() {
     hold(PAD_KEYS[2], 'Breakdown', 'let go = drop', () => engine.setBreakdown(true), () => engine.setBreakdown(false)),
   ];
 
-  const mix = TRACKS.map((t) => el('div', { class: `mix-row${song.mute[t] ? ' muted' : ''}`, style: { '--c': TAB[t].color } },
-    el('span', { class: 'mix-name' }, TAB[t].name),
-    el('input', {
-      type: 'range', min: 0, max: 1, step: 0.01, value: song.vol[t], 'aria-label': `${TAB[t].name} volume`,
-      oninput: (e) => dispatch({ k: 'vol', t, v: Number(e.target.value) }, { tag: `vol-${t}` }),
-    }),
-    el('button', { class: `mute${song.mute[t] ? ' on' : ''}`, onclick: () => dispatch({ k: 'mute', t, v: !song.mute[t] }) },
-      song.mute[t] ? 'muted' : 'on')));
+  // Mute updates its row in place: re-rendering the panel would jump it back to the top.
+  const mix = TRACKS.map((t) => {
+    const btn = el('button', { class: 'mute' });
+    const row = el('div', { class: 'mix-row', style: { '--c': TAB[t].color } },
+      el('span', { class: 'mix-name' }, TAB[t].name),
+      el('input', {
+        type: 'range', min: 0, max: 1, step: 0.01, value: song.vol[t], 'aria-label': `${TAB[t].name} volume`,
+        oninput: (e) => dispatch({ k: 'vol', t, v: Number(e.target.value) }, { tag: `vol-${t}` }),
+      }),
+      btn);
+    const paint = () => {
+      row.classList.toggle('muted', song.mute[t]);
+      btn.classList.toggle('on', song.mute[t]);
+      btn.textContent = song.mute[t] ? 'muted' : 'on';
+    };
+    btn.onclick = () => dispatch({ k: 'mute', t, v: !song.mute[t] }) && paint();
+    paint();
+    return row;
+  });
 
   // Tempo: a slider, plus nudges for exact steps.
   const bpmOut = el('output', { class: 'tempo-value' }, String(song.bpm));
@@ -809,8 +840,9 @@ function fxPanel() {
     el('button', { class: 'chip', 'aria-label': 'Faster', onclick: () => setBpm(song.bpm + 1) }, '+'));
 
   return [
-    el('section', { class: 'block xy-block' }, xy),
-    el('section', { class: 'block' }, el('h3', {}, 'Hold'), el('div', { class: 'pads pads-3' }, ...holds)),
+    el('div', { class: 'fx-stage' },
+      el('section', { class: 'block xy-block' }, xy),
+      el('section', { class: 'block' }, el('h3', {}, 'Hold'), el('div', { class: 'pads pads-3' }, ...holds))),
     el('section', { class: 'block' }, el('h3', {}, 'Tempo'), tempo),
     el('section', { class: 'block' }, el('h3', {}, 'Levels'), el('div', { class: 'mix' }, ...mix)),
   ];
@@ -1197,8 +1229,12 @@ Tone.getContext().lookAhead = 0.05;
 // One screen, exactly: see body in style.css. --app-h follows the visible height (it shrinks
 // with Safari's bars). The status bar is opaque on purpose: with black-translucent, iOS 26 sizes a
 // home-screen app's view a status bar short and leaves that strip blank under the tab bar.
+// It is an instrument played with two fingers (hold record, slide the knob), which phones took
+// for a pinch: zoom is off in the viewport tag, and a zoom that happens anyway (accessibility
+// settings) must not relayout the whole app on every move, which stalled the audio.
 function fitScreen() {
-  const h = window.visualViewport?.height ?? window.innerHeight;
+  const v = window.visualViewport;
+  const h = v ? v.height * v.scale : window.innerHeight;
   document.documentElement.style.setProperty('--app-h', `${h}px`);
 }
 fitScreen();

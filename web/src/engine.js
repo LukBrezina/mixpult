@@ -2,7 +2,7 @@
 // The engine reads the song on every step, so edits are heard on the next pass of the loop.
 // While a knob is touched, that track plays "live" from the knob instead of from the song.
 import * as Tone from 'tone';
-import { DrumKit, LAYERS, createLayer, createSub, createVoiceChain } from './sounds.js';
+import { DrumKit, LAYERS, Mixer, SUB, VOICE_FX, instrument, layerSpec } from './sounds.js';
 import { clips } from './voice.js';
 import { TRACKS, LOOP, SLOT, activeNote } from './song.js';
 import { DRUM_LANES, DRUM_GROOVES, layerLevel } from './patterns.js';
@@ -28,9 +28,11 @@ const MELODIC = ['bass', 'lead'];
 const LAYERED = ['chords', ...MELODIC];
 const perTrack = (v) => Object.fromEntries(TRACKS.map((t) => [t, v]));
 const CHORD_SLOT = SLOT.chords;
-// XY "space": the send into the hall at the top of the pad, and how far the dry mix steps back there.
+// XY "space": the send into the reverb at the top of the pad, and how far the dry mix steps back.
 const WASH_SEND = 0.9;
 const WASH_DUCK = 0.3;
+// Reverb and delay sends per track.
+const SENDS = { drums: [0.06, 0], chords: [0.3, 0.12], bass: [0, 0], lead: [0.3, 0.28], voice: [0.32, 0.2] };
 
 export class Engine {
   constructor(song) {
@@ -45,67 +47,42 @@ export class Engine {
     this.punch = perTrack(false); // recording over the track: its old notes stay silent
     this.liveMidi = perTrack(null);
     this.lastStart = perTrack(0); // latest note start scheduled on each melodic track's synths
+    this.sounding = perTrack(null); // the melodic note under way: { midi, until, vel }, for layerIn
     this.x = perTrack(null); // energy currently applied
-    this.clipSources = new Map(); // voice clips playing right now -> their end time
-    this.offline = Tone.getContext() instanceof Tone.OfflineContext;
+    this.clipsSent = new Map(); // voice clips the worklet has: id -> AudioBuffer
     this.padDirty = true; // the pad must be (re)started at the next slot
     this.latency = 0; // extra user calibration, seconds
+    this.top = Math.min(20000, Tone.getContext().sampleRate * 0.45); // the DJ lowpass when open
 
-    // Master: DJ filters -> glue compressor -> limiter.
-    this.master = new Tone.Gain(1);
-    this.djHP = new Tone.Filter({ type: 'highpass', frequency: 10, rolloff: -24, Q: 1 });
-    this.djLP = new Tone.Filter({ type: 'lowpass', frequency: 20000, rolloff: -24, Q: 1 });
-    this.comp = new Tone.Compressor({ threshold: -16, ratio: 2.5, attack: 0.015, release: 0.2, knee: 8 });
-    this.limiter = new Tone.Limiter(-1);
-    // Soft clipper after the limiter: linear up to 0.7, then rounds off so peaks never pass 0 dBFS.
-    this.clip = new Tone.WaveShaper((x) => {
-      const a = Math.abs(x);
-      return a < 0.7 ? x : Math.sign(x) * (0.7 + 0.29 * Math.tanh((a - 0.7) / 0.29));
-    }, 4096);
-    this.out = new Tone.Volume(-1);
-    this.dry = new Tone.Gain(1);
-    this.master.chain(this.dry, this.djHP, this.djLP, this.comp, this.limiter, this.clip, this.out, Tone.getDestination());
-    // Space (XY pad up): the whole mix is thrown into a big hall that rings on after letting go.
-    // It returns before the DJ filters, so muffled or thin plus space sweeps the tail too.
-    this.washSend = new Tone.Gain(0);
-    this.wash = new Tone.Reverb({ decay: 6.5, preDelay: 0.02, wet: 1 });
-    this.master.chain(this.washSend, new Tone.Filter({ type: 'highpass', frequency: 280 }), this.wash, this.djHP);
-
-    // Everything except drums goes through this bus, which ducks on every kick (sidechain pump).
-    this.music = new Tone.Gain(1).connect(this.master);
-
-    this.reverb = new Tone.Reverb({ decay: 3.8, preDelay: 0.03, wet: 1 });
-    this.reverbIn = new Tone.Filter({ type: 'highpass', frequency: 300 });
-    this.reverbIn.chain(this.reverb, this.music);
-    this.delay = new Tone.FeedbackDelay({ delayTime: '8n.', feedback: 0.35, wet: 1 });
-    this.delayIn = new Tone.Filter({ type: 'bandpass', frequency: 2000, Q: 0.5 });
-    this.delayIn.chain(this.delay, this.music);
-
-    const SENDS = { drums: [0.06, 0], chords: [0.3, 0.12], bass: [0, 0], lead: [0.3, 0.28], voice: [0.32, 0.2] };
+    // The whole mix runs in an AudioWorklet (see mix.worklet.js and sounds.js). Every track is a
+    // mono channel with sends into one reverb and a dotted delay. Everything except drums goes
+    // through the music bus, which ducks on every kick (sidechain pump); the delay returns there.
+    // The master: the DJ filters, a glue compressor, a limiter and a soft clipper. The reverb
+    // return comes in after the master bus, before the DJ filters, so the master can feed it too:
+    // that is the XY pad's space, the whole mix thrown into the room, ringing on after letting go.
+    this.mixer = new Mixer({
+      tracks: TRACKS.map((id) => ({ id, bus: id === 'drums' ? 'master' : 'music', rev: SENDS[id][0], del: SENDS[id][1] })),
+      drums: 'drums',
+      voice: 'voice',
+      voiceFx: VOICE_FX,
+      delay: { time: this.transport.toSeconds('8n.'), feedback: 0.35, filter: { type: 'bandpass', frequency: 2000, Q: 0.5 } },
+      reverbIn: { type: 'highpass', frequency: 300 },
+      master: {
+        top: this.top,
+        reverb: { decay: 3.8, preDelay: 0.03 },
+        comp: { threshold: -16, ratio: 2.5, attack: 0.015, release: 0.2, knee: 8 },
+        limiter: { threshold: -1, ratio: 20, attack: 0.003, release: 0.01, knee: 30 }, // Tone.Limiter
+        out: Tone.dbToGain(-1),
+      },
+    });
     this.tracks = {};
-    for (const t of TRACKS) {
-      const channel = new Tone.Channel();
-      channel.connect(t === 'drums' ? this.master : this.music);
-      const [rev, del] = SENDS[t];
-      if (rev) channel.connect(new Tone.Gain(rev).connect(this.reverbIn));
-      if (del) channel.connect(new Tone.Gain(del).connect(this.delayIn));
-      this.tracks[t] = { channel };
-    }
-
-    this.drums = new DrumKit(this.tracks.drums.channel);
-    this.voice = createVoiceChain();
-    this.voice.output.connect(this.tracks.voice.channel);
+    for (const t of TRACKS) this.tracks[t] = {};
+    this.drums = new DrumKit(this.mixer);
     for (const t of LAYERED) {
-      const tr = this.tracks[t];
-      tr.layers = LAYERS[t].map((id) => {
-        const inst = createLayer(t, id);
-        const gain = new Tone.Gain(0).connect(tr.channel);
-        inst.output.connect(gain);
-        return { inst, gain };
-      });
+      // Each layer has its own fader in the worklet, opened by the knob (see setX).
+      this.tracks[t].layers = LAYERS[t].map((id) => ({ inst: instrument(this.mixer, { ...layerSpec(t, id), track: t, gain: 0 }) }));
     }
-    this.tracks.bass.sub = createSub();
-    this.tracks.bass.sub.output.connect(this.tracks.bass.channel);
+    this.tracks.bass.sub = instrument(this.mixer, { ...SUB, track: 'bass' });
     for (const t of TRACKS) this.setX(t, song[t].x[0], 0);
     this.applyMix();
 
@@ -113,32 +90,36 @@ export class Engine {
   }
 
   get ready() {
-    return Promise.all([this.drums.ready, this.reverb.ready, this.wash.ready]);
+    this.mixerReady ??= this.mixer.ready();
+    return Promise.all([this.drums.ready, this.mixerReady]);
   }
 
   // ---------- song / mixer ----------
 
   setSong(song) {
     this.song = song;
-    this.sync({ k: 'slot', t: 'chords' });
+    this.applyMix();
+    this.retriggerPad();
   }
 
-  // Bring the mixer in line with the song after an op.
+  // Bring the mixer in line with the song after an op. Only mixer ops touch the mixer: a
+  // recording sends an op every step, and fresh volume ramps on every channel each time kept
+  // the audio thread busy enough that a phone broke up while recording.
   sync(op) {
-    this.applyMix();
-    if (op?.k === 'slot' && op.t === 'chords') this.retriggerPad();
+    if (['bpm', 'vol', 'mute'].includes(op.k)) this.applyMix();
+    if (op.k === 'slot' && op.t === 'chords') this.retriggerPad();
   }
 
   applyMix() {
+    const now = Tone.now();
     if (Math.round(this.transport.bpm.value) !== this.song.bpm) {
       this.transport.bpm.value = this.song.bpm;
       // The delay was set in note values: keep it on the beat at the new tempo.
-      this.delay.delayTime.rampTo(this.transport.toSeconds('8n.'), 0.1);
+      this.mixer.param('delayTime', this.transport.toSeconds('8n.'), now, 0.1);
     }
     for (const t of TRACKS) {
-      const tr = this.tracks[t];
-      tr.channel.volume.rampTo(sliderToDb(this.song.vol[t]), 0.05);
-      tr.channel.mute = this.song.mute[t];
+      this.mixer.param('vol.' + t, Tone.dbToGain(sliderToDb(this.song.vol[t])), now, 0.05);
+      this.mixer.param('mute.' + t, this.song.mute[t] ? 0 : 1, now, 0.005);
     }
   }
 
@@ -148,24 +129,60 @@ export class Engine {
 
   // Left/right energy: crossfades the three layers of a track (drums use it per hit).
   setX(t, x, time) {
-    if (this.x[t] !== null && Math.abs(x - this.x[t]) < 0.004) return;
+    const was = this.x[t];
+    if (was !== null && Math.abs(x - was) < 0.004) return;
     this.x[t] = x;
     if (!this.tracks[t].layers) return; // drums use it per hit, voice not at all
-    xfade(x).forEach((g, i) => this.tracks[t].layers[i].gain.gain.setTargetAtTime(g, time, 0.025));
+    const before = was === null ? null : xfade(was);
+    xfade(x).forEach((g, i) => {
+      this.mixer.param('gain.' + this.tracks[t].layers[i].inst.index, g, time, 0.025, 'target');
+      if (before && before[i] === 0 && g > 0) this.layerIn(t, i, time);
+    });
+  }
+
+  // Only the layers the knob lets through play notes: at most two of three are ever audible, and
+  // synths playing into a closed fader would cost a phone's CPU for nothing.
+  heardLayers(t) {
+    const g = xfade(this.x[t]);
+    return this.tracks[t].layers.filter((_, i) => g[i] > 0);
+  }
+
+  // A layer fades in while its track sounds: it joins the note (or pad chord) under way.
+  layerIn(t, i, time) {
+    if (!this.audible(t) || this.stutter) return;
+    const { inst } = this.tracks[t].layers[i];
+    if (t === 'chords') {
+      if (i !== 0) return; // stabs and arpeggio play on the next step anyway
+      if (this.live.chords) inst.start(voiceChord(CHORDS[this.live.chords.row]), time, 0.7);
+      else if (this.playing) {
+        const pos = (this.transport.getTicksAtTime(time) / (this.transport.PPQ / 4)) % LOOP;
+        const left = (CHORD_SLOT - (pos % CHORD_SLOT)) * this.stepSeconds() - 0.03;
+        if (left > 0.08) inst.play(voiceChord(this.chordAt(Math.floor(pos))), time, left, 0.7);
+        this.padDirty = true; // the next slot starts it properly
+      }
+      return;
+    }
+    const n = this.sounding[t];
+    // Never before the track's latest start: a mono synth refuses that (see liveTime).
+    const at = Math.max(time, this.lastStart[t] + 0.003);
+    if (!n || n.until < at + 0.05) return;
+    if (n.until === Infinity) inst.start(n.midi, at, n.vel);
+    else inst.play(n.midi, at, n.until - at, n.vel);
+    this.noteStarted(t, at);
   }
 
   // XY pad. x: -1 = lowpass down, 0 = off, +1 = highpass up. y: 0..1 space (plus a little
   // resonance, so a sweep up there sings), with the dry mix stepping back as the hall grows.
   setXY(x, y) {
-    const lp = x < 0 ? 20000 * Math.pow(160 / 20000, -x) : 20000;
+    const lp = x < 0 ? this.top * Math.pow(160 / this.top, -x) : this.top;
     const hp = x > 0 ? 20 * Math.pow(6000 / 20, x) : 10;
     const q = 0.8 + y * 3;
-    this.djLP.frequency.rampTo(lp, 0.04);
-    this.djHP.frequency.rampTo(hp, 0.04);
-    this.djLP.Q.rampTo(q, 0.04);
-    this.djHP.Q.rampTo(q, 0.04);
-    this.washSend.gain.rampTo(WASH_SEND * Math.sqrt(y), 0.06);
-    this.dry.gain.rampTo(1 - WASH_DUCK * y, 0.06);
+    const now = Tone.now();
+    this.mixer.param('lp', lp, now, 0.04, 'exp');
+    this.mixer.param('hp', hp, now, 0.04, 'exp');
+    this.mixer.param('q', q, now, 0.04);
+    this.mixer.param('wash', WASH_SEND * Math.sqrt(y), now, 0.06);
+    this.mixer.param('dry', 1 - WASH_DUCK * y, now, 0.06);
   }
 
   // Beat repeat, like a DJ loop roll: while held, the first `len` steps of the current beat play
@@ -218,7 +235,7 @@ export class Engine {
 
   // Silences everything at the very end, reverb and delay tails too (while the mic records).
   hush(on) {
-    this.out.volume.rampTo(on ? -80 : -1, on ? 0.12 : 0.05);
+    this.mixer.param('out', Tone.dbToGain(on ? -80 : -1), Tone.now(), on ? 0.12 : 0.05, 'exp');
   }
 
   stepSeconds() {
@@ -229,7 +246,8 @@ export class Engine {
   heardStepFloat() {
     const ctx = Tone.getContext().rawContext;
     const lat = (ctx.outputLatency || 0) + (ctx.baseLatency || 0) + this.latency;
-    const ticks = this.transport.getTicksAtTime(Tone.immediate() - lat);
+    // Never before 0: Tone throws for a time ahead of its first state (just after the context starts).
+    const ticks = this.transport.getTicksAtTime(Math.max(0, Tone.immediate() - lat));
     return Math.max(0, ticks / (this.transport.PPQ / 4));
   }
 
@@ -300,10 +318,8 @@ export class Engine {
   }
 
   duck(time) {
-    const g = this.music.gain;
-    g.cancelScheduledValues(time);
-    g.setValueAtTime(0.6, time);
-    g.setTargetAtTime(1, time + 0.015, 0.07);
+    this.mixer.param('duck', 0.6, time);
+    this.mixer.param('duck', 1, time + 0.015, 0.07, 'target');
   }
 
   tickDrums(step, time) {
@@ -327,12 +343,12 @@ export class Engine {
     const sd = this.stepSeconds();
     const s = step % 16;
 
-    // Pad: one long chord for as long as it stays the same within the bar. Always played, even when
-    // faded out, so sliding left brings it in smoothly. The live chord is held by setLive instead.
+    // Pad: one long chord for as long as it stays the same within the bar. Faded out, it is skipped;
+    // sliding left brings it in through layerIn. The live chord is held by setLive instead.
     if (!this.live.chords && s % CHORD_SLOT === 0 && (s === 0 || this.padDirty || this.chordIndexAt(step - 1) !== c)) {
       let run = CHORD_SLOT;
       while (s + run < 16 && this.chordIndexAt(step + run) === c) run += CHORD_SLOT;
-      pad.inst.play(notes, time, run * sd - 0.03, 0.7);
+      if (g[0] > 0) pad.inst.play(notes, time, run * sd - 0.03, 0.7);
       this.padDirty = false;
     }
     // Stabs on the off-beat (the kick owns the beat), arpeggio on every 16th.
@@ -365,9 +381,10 @@ export class Engine {
     const dur = len * this.stepSeconds() - (len >= dist ? 0.008 : 0);
     const vel = step % 4 === 0 ? 0.95 : 0.8;
     const midi = this.noteFor(track, n.row, step);
-    for (const l of this.tracks[track].layers) l.inst.play(midi, time, dur, vel);
+    for (const l of this.heardLayers(track)) l.inst.play(midi, time, dur, vel);
     this.tracks[track].sub?.play(midi, time, dur, vel);
     this.noteStarted(track, time);
+    this.sounding[track] = { midi, until: time + dur, vel };
   }
 
   // One beat-repeat slice: everything that sounds at `step` starts again, whether its note began
@@ -376,16 +393,17 @@ export class Engine {
     const len = dur * 0.9;
     if (this.audible('chords') && !this.live.chords) {
       const notes = voiceChord(this.chordAt(step));
-      for (const l of this.tracks.chords.layers) l.inst.play(notes, time, len, 0.7);
+      for (const l of this.heardLayers('chords')) l.inst.play(notes, time, len, 0.7);
     }
     for (const t of MELODIC) {
       if (!this.audible(t) || this.live[t] || this.punch[t] || (t === 'bass' && this.breakdown)) continue;
       const act = activeNote(this.song[t].notes, step);
       if (!act) continue;
       const midi = this.noteFor(t, act.note.row, step);
-      for (const l of this.tracks[t].layers) l.inst.play(midi, time, len, 0.9);
+      for (const l of this.heardLayers(t)) l.inst.play(midi, time, len, 0.9);
       this.tracks[t].sub?.play(midi, time, len, 0.9);
       this.noteStarted(t, time);
+      this.sounding[t] = { midi, until: time + len, vel: 0.9 };
     }
     const v = activeNote(this.song.voice.notes, step);
     if (v && this.audible('voice') && !this.live.voice && !this.punch.voice) {
@@ -408,32 +426,34 @@ export class Engine {
 
   // One clip at a time, like chopping on a launchpad: a new one cuts the last.
   playClip(pad, time, dur = Infinity, offset = 0) {
-    const buf = clips.get(this.song.voice.pads[pad]);
+    const id = this.song.voice.pads[pad];
+    const buf = clips.get(id);
     this.stopClips(time);
     if (!buf || offset >= buf.duration) return;
-    // Cleaned up here by time, not in onended: an offline render (WAV export) runs the whole
-    // sequencer before rendering a sample, and disposing there would silence every clip.
-    for (const [old, end] of this.clipSources) {
-      if (!this.offline && end < time - 1) {
-        old.dispose();
-        this.clipSources.delete(old);
-      }
-    }
-    const src = new Tone.ToneBufferSource({ context: this.voice.input.context, url: buf, fadeIn: 0.003, fadeOut: 0.03 });
-    src.connect(this.voice.input);
-    const len = Math.min(dur, buf.duration - offset);
-    this.clipSources.set(src, time + len);
-    src.start(time, offset, len);
+    this.sendClip(id, buf);
+    this.mixer.send({ t: 'clip', id: 'clip:' + id, time, offset, len: Math.min(dur, buf.duration - offset) });
+  }
+
+  // The worklet gets a clip the first time it plays (and lets go of clips no longer on the pads).
+  sendClip(id, buf) {
+    if (this.clipsSent.get(id) === buf) return;
+    const pads = new Set(this.song.voice.pads);
+    const drop = [...this.clipsSent.keys()].filter((k) => !pads.has(k));
+    for (const k of drop) this.clipsSent.delete(k);
+    this.clipsSent.set(id, buf);
+    const data = buf.getChannelData(0).slice();
+    this.mixer.send({ t: 'sample', id: 'clip:' + id, data, rate: buf.sampleRate, drop: drop.map((k) => 'clip:' + k) }, [data.buffer]);
   }
 
   stopClips(time) {
-    for (const [src, end] of this.clipSources) if (end > time) src.stop(time);
+    this.mixer.send({ t: 'clipStop', time });
   }
 
   startNote(track, midi, time, vel = 0.9) {
-    for (const l of this.tracks[track].layers) l.inst.start(midi, time, vel);
+    for (const l of this.heardLayers(track)) l.inst.start(midi, time, vel);
     this.tracks[track].sub?.start(midi, time, vel);
     this.noteStarted(track, time);
+    this.sounding[track] = { midi, until: Infinity, vel };
   }
 
   // Tone moves a start that is already in the past (a late tick) to the current time.
@@ -451,6 +471,7 @@ export class Engine {
   silenceTrack(track, time) {
     for (const l of this.tracks[track].layers) l.inst.silence(time);
     this.tracks[track].sub?.silence(time);
+    if (track in this.sounding) this.sounding[track] = null;
   }
 
   // ---------- live (knob touched) ----------
@@ -478,7 +499,7 @@ export class Engine {
       if (prev?.row !== v.row) {
         const pad = this.tracks.chords.layers[0].inst;
         pad.silence(now);
-        pad.start(voiceChord(CHORDS[v.row]), now + 0.005, 0.7);
+        if (xfade(v.x)[0] > 0) pad.start(voiceChord(CHORDS[v.row]), now + 0.005, 0.7);
       }
     } else if (t !== 'drums') {
       const midi = this.noteFor(t, v.row, this.heardStep());
@@ -503,7 +524,7 @@ export class Engine {
 
   // Back from a beat repeat in the middle of a chord slot: the pad plays the rest of it.
   resumePad(step, time) {
-    if (this.live.chords || !this.audible('chords') || step % CHORD_SLOT === 0) return;
+    if (this.live.chords || !this.audible('chords') || step % CHORD_SLOT === 0 || xfade(this.x.chords)[0] === 0) return;
     const left = (CHORD_SLOT - (step % CHORD_SLOT)) * this.stepSeconds() - 0.03;
     this.tracks.chords.layers[0].inst.play(voiceChord(this.chordAt(step)), time, left, 0.7);
   }
@@ -515,7 +536,7 @@ export class Engine {
     const now = Tone.immediate();
     pad.silence(now);
     this.padDirty = true;
-    if (!this.playing || !this.audible('chords')) return;
+    if (!this.playing || !this.audible('chords') || xfade(this.x.chords)[0] === 0) return;
     const pos = this.heardStepFloat() % LOOP;
     const slot = Math.floor(pos / CHORD_SLOT);
     const left = ((slot + 1) * CHORD_SLOT - pos) * this.stepSeconds() - 0.03;

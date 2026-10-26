@@ -1,5 +1,6 @@
 // The app on Cloudflare: `npm run deploy` builds dist/ and uploads it. worker.js answers /api/*
-// (shared songs, kept in KV); every other path is a static file from dist/.
+// (shared songs, kept in KV) and / (to give shared song links their own preview); every other
+// path is a static file from dist/.
 {
   "name": "mixpult",
   "main": "worker.js",
@@ -7,7 +8,7 @@
   "assets": {
     "directory": "./dist",
     "binding": "ASSETS",
-    "run_worker_first": ["/api/*"]
+    "run_worker_first": ["/api/*", "/"]
   },
   "kv_namespaces": [
     { "binding": "SONGS", "id": "66b401e037a1488298e343552c3973aa" }

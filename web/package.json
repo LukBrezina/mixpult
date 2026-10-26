@@ -8,6 +8,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "test": "node --test src/*.test.js",
+    "dsp": "cargo build --release --target wasm32-unknown-unknown --manifest-path dsp/Cargo.toml && cp dsp/target/wasm32-unknown-unknown/release/mixpult_dsp.wasm src/dsp.wasm",
     "deploy": "vite build && wrangler deploy"
   },
   "dependencies": {

@@ -31,5 +31,6 @@ The phone only allows the microphone over https, so the dev server uses a self-s
 - `src/main.js` – UI
 - `worker.js` – Cloudflare Worker: serves `dist/`, stores shared songs in KV (`/api/songs`)
 - `docs/demo.gif`, `public/demo.mp4` – the demo in the top-level README
+- `docs/og-card.html` – the link preview card; screenshot it at 1200×630 into `public/og.jpg` (and with `?song` into `public/og-song.jpg`, the card for shared songs)
 
 Samples: see `public/samples/CREDITS.md`.

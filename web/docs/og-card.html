@@ -1,0 +1,122 @@
+<!doctype html>
+<!-- The link preview card (1200x630) for WhatsApp, Facebook, iMessage and co. Rendered to
+     public/og.jpg, and with ?song to public/og-song.jpg for shared song links; see web/README.md. -->
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet" />
+    <style>
+      html, body { margin: 0; }
+      body {
+        width: 1200px;
+        height: 630px;
+        overflow: hidden;
+        position: relative;
+        font-family: 'Space Grotesk', system-ui, sans-serif;
+        color: #f1edff;
+        background:
+          radial-gradient(70% 90% at 30% -10%, rgb(255 62 165 / 0.34), transparent 60%),
+          radial-gradient(50% 70% at 105% 105%, rgb(54 214 255 / 0.24), transparent 70%),
+          radial-gradient(40% 60% at -5% 100%, rgb(155 107 255 / 0.22), transparent 70%),
+          #0b0a17;
+      }
+      .grid {
+        position: absolute;
+        inset: 0;
+        background:
+          repeating-linear-gradient(0deg, transparent 0 59px, rgb(255 255 255 / 0.05) 59px 60px),
+          repeating-linear-gradient(90deg, transparent 0 59px, rgb(255 255 255 / 0.05) 59px 60px);
+        mask-image: linear-gradient(180deg, transparent, #000 40%, #000);
+      }
+      .text {
+        position: absolute;
+        left: 80px;
+        top: 70px;
+        right: 80px;
+      }
+      .logo {
+        display: flex;
+        align-items: center;
+        gap: 18px;
+        font-weight: 700;
+        font-size: 30px;
+        letter-spacing: 0.22em;
+        text-transform: uppercase;
+      }
+      .logo img {
+        width: 64px;
+        height: 64px;
+        border-radius: 16px;
+        box-shadow: 0 0 0 1px rgb(255 255 255 / 0.12), 0 8px 30px rgb(255 62 165 / 0.35);
+      }
+      .logo span {
+        background: linear-gradient(90deg, #ffb03a, #ff3ea5 50%, #9b6bff);
+        -webkit-background-clip: text;
+        background-clip: text;
+        color: transparent;
+      }
+      h1 {
+        margin: 42px 0 0;
+        font-size: 84px;
+        line-height: 0.98;
+        letter-spacing: -0.03em;
+        font-weight: 700;
+      }
+      p {
+        margin: 22px 0 0;
+        font-size: 30px;
+        color: #b7aee0;
+      }
+      svg {
+        position: absolute;
+        left: 0;
+        bottom: 0;
+      }
+      .song { display: none; }
+      body.shared .app { display: none; }
+      body.shared .song { display: block; }
+    </style>
+  </head>
+  <body>
+    <div class="grid"></div>
+    <div class="text">
+      <div class="logo"><img src="../public/icon-192.png" alt="" /><span>Mixpult</span></div>
+      <div class="app">
+        <h1>Catchy night techno<br />from your phone.</h1>
+        <p>Touch a pad to hear it, hold to record. No notes needed.</p>
+      </div>
+      <div class="song">
+        <h1>I made a track.<br />Come remix it.</h1>
+        <p>Tap to hear it, then make it your own.</p>
+      </div>
+    </div>
+    <!-- The loop as a glowing line, one stretch per track colour, like the app draws it. -->
+    <svg width="1200" height="630" viewBox="0 0 1200 630">
+      <defs>
+        <linearGradient id="line" x1="0" x2="1">
+          <stop offset="0" stop-color="#ffb03a" />
+          <stop offset="0.3" stop-color="#ff3ea5" />
+          <stop offset="0.62" stop-color="#9b6bff" />
+          <stop offset="1" stop-color="#36d6ff" />
+        </linearGradient>
+        <radialGradient id="puck" cx="38%" cy="34%" r="70%">
+          <stop offset="0" stop-color="#ffffff" />
+          <stop offset="0.45" stop-color="#ffe3f1" />
+          <stop offset="1" stop-color="#ff3ea5" />
+        </radialGradient>
+        <filter id="blur" x="-10%" y="-60%" width="120%" height="220%">
+          <feGaussianBlur stdDeviation="16" />
+        </filter>
+      </defs>
+      <path d="M-20 560H190Q210 560 210 540V510Q210 490 230 490H330Q350 490 350 510V540Q350 560 370 560H440Q460 560 460 540V470Q460 450 480 450H600Q620 450 620 470V500Q620 520 640 520H700Q720 520 720 500V430Q720 410 740 410H860Q880 410 880 430V520Q880 540 900 540H960Q980 540 980 520V470Q980 450 1000 450H1220"
+            fill="none" stroke="url(#line)" stroke-width="26" stroke-linecap="round" stroke-linejoin="round" filter="url(#blur)" opacity="0.9" />
+      <path d="M-20 560H190Q210 560 210 540V510Q210 490 230 490H330Q350 490 350 510V540Q350 560 370 560H440Q460 560 460 540V470Q460 450 480 450H600Q620 450 620 470V500Q620 520 640 520H700Q720 520 720 500V430Q720 410 740 410H860Q880 410 880 430V520Q880 540 900 540H960Q980 540 980 520V470Q980 450 1000 450H1220"
+            fill="none" stroke="url(#line)" stroke-width="12" stroke-linecap="round" stroke-linejoin="round" />
+      <circle cx="560" cy="450" r="44" fill="#ff3ea5" opacity="0.4" filter="url(#blur)" />
+      <circle cx="560" cy="450" r="24" fill="url(#puck)" />
+    </svg>
+    <script>
+      if (location.search === '?song') document.body.classList.add('shared');
+    </script>
+  </body>
+</html>

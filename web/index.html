@@ -2,13 +2,25 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
     <meta name="theme-color" content="#0b0a17" />
     <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black" />
     <link rel="manifest" href="manifest.webmanifest" />
     <title>Mixpult</title>
+    <meta name="description" content="Catchy night techno from your phone. Touch a pad to hear it, hold to record. No notes needed." />
+    <!-- Link previews (WhatsApp, Facebook, iMessage...). The worker swaps these for shared songs. -->
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Mixpult" />
+    <meta property="og:title" content="Mixpult: catchy night techno from your phone" />
+    <meta property="og:description" content="Touch a pad to hear it, hold to record. No notes needed." />
+    <meta property="og:url" content="https://mixpult.brezinovi.sk/" />
+    <meta property="og:image" content="https://mixpult.brezinovi.sk/og.jpg" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="Mixpult: a glowing loop line under the words Catchy night techno from your phone" />
+    <meta name="twitter:card" content="summary_large_image" />
     <link rel="icon" href="icon.svg" type="image/svg+xml" />
     <link rel="apple-touch-icon" href="apple-touch-icon.png" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
@@ -47,6 +59,7 @@
             <input id="latency" type="range" min="-120" max="120" step="5" />
             <output id="latency-out"></output>
           </label>
+          <small id="build" class="menu-info"></small>
         </div>
       </details>
       <button id="play" class="play" aria-label="Play">

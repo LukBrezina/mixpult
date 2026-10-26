@@ -90,9 +90,12 @@ export function knobPad({ rows, value = [0.5, 0], rowColor, labels = [], label, 
     el('div', { class: 'knob-labels' }, ...labels.map((txt) => el('span', {}, txt))),
     puck);
   let [x, row] = value;
+  // The puck moves by transform on its own layer: moving it by left/bottom repainted the whole
+  // page with its glow on every touch move, which a phone's GPU could not keep up with.
   function place() {
-    puck.style.left = `calc(${INSET}px + ${x} * (100% - ${2 * INSET}px))`;
-    puck.style.bottom = yPos(row);
+    const fy = rows > 1 ? row / (rows - 1) : 0.5;
+    puck.style.translate = `${INSET + x * (pad.clientWidth - 2 * INSET)}px 0`;
+    puck.style.transform = `translateY(${-(INSET + fy * (pad.clientHeight - 2 * INSET))}px) translate(-50%, 50%)`;
     pad.style.setProperty('--pc', rowColor(row));
     pad.setAttribute('aria-valuenow', String(row + 1));
   }
@@ -129,7 +132,7 @@ export function knobPad({ rows, value = [0.5, 0], rowColor, labels = [], label, 
   };
   pad.addEventListener('pointerup', up);
   pad.addEventListener('pointercancel', up);
-  place();
+  new ResizeObserver(place).observe(pad);
   pad.nudge = (dx, dr) => set(x + dx, row + dr);
   pad.value = () => [x, row];
   return pad;

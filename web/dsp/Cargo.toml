@@ -1,0 +1,15 @@
+[package]
+name = "mixpult-dsp"
+version = "0.1.0"
+edition = "2021"
+description = "Mixpult's whole mix (synths, samples, effects, mixer, master) as WebAssembly for the AudioWorklet"
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
